@@ -18,6 +18,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Intentional non-ABI entries that are documented but not public entrypoints.
 AUDIT_ENTRYPOINT_ALLOWLIST = {"upgrade", "compute_keeper_fee_split"}
 
+# Soroban 16 KiB event byte footprint enforcer (issue #288).
+EVENT_BUDGET_SCRIPT = REPO_ROOT / "script" / "event-byte-budget.py"
+EVENT_BUDGET_DOCS = [
+    REPO_ROOT / "docs" / "soroban-rpc-read-skew.md",
+    REPO_ROOT / "docs" / "gas.md",
+]
+# Public API surface of the enforcer that docs must reference.
+EVENT_BUDGET_PUBLIC_API = [
+    "MAX_EVENT_BYTES",
+    "check_event_byte_budget",
+    "enforce_event_byte_budget",
+]
+# The 16 KiB event budget must be referenced in the docs.
+EVENT_BUDGET_MARKER = "16 KiB"
+
 
 def extract_contractimpl_pub_fns(source: str) -> list[str]:
     """Extract public function names from #[contractimpl] blocks."""
@@ -180,6 +195,71 @@ def check_error_alignment() -> bool:
     return True
 
 
+def extract_public_functions(source: str) -> list[str]:
+    """Extract public function names from a Python module source."""
+    fns = []
+    for line in source.splitlines():
+        match = re.match(r"def\s+(\w+)\s*\(", line)
+        if match and not match.group(1).startswith("_"):
+            fns.append(match.group(1))
+    return sorted(set(fns))
+
+
+def has_docstring(source: str, fn_name: str) -> bool:
+    """Return True if the named function has a docstring."""
+    lines = source.splitlines()
+    for idx, line in enumerate(lines):
+        match = re.match(rf"def\s+{re.escape(fn_name)}\s*\(", line)
+        if not match:
+            continue
+        # Scan forward for the first non-empty line after the signature.
+        for follow in lines[idx + 1:]:
+            stripped = follow.strip()
+            if not stripped:
+                continue
+            return stripped.startswith(('"""', "'''", 'r"""', "r'''"))
+        return False
+    return False
+
+
+def check_event_byte_budget_docs() -> bool:
+    """Check docstrings and markdown references for event-byte-budget.py."""
+    if not EVENT_BUDGET_SCRIPT.exists():
+        print(f"SKIP: {EVENT_BUDGET_SCRIPT} not found")
+        return True
+
+    source = EVENT_BUDGET_SCRIPT.read_text(encoding="utf-8")
+
+    # Every public function must have a docstring.
+    public_fns = extract_public_functions(source)
+    undocumented = [fn for fn in public_fns if not has_docstring(source, fn)]
+    if undocumented:
+        print(
+            f"WARNING: {len(undocumented)} public function(s) in "
+            f"{EVENT_BUDGET_SCRIPT.name} missing docstring: {undocumented}"
+        )
+
+    # Markdown docs must reference the enforcer's public API and 16 KiB budget.
+    for doc_path in EVENT_BUDGET_DOCS:
+        if not doc_path.exists():
+            print(f"SKIP: {doc_path} not found")
+            continue
+        doc = doc_path.read_text(encoding="utf-8")
+        missing_api = [name for name in EVENT_BUDGET_PUBLIC_API if name not in doc]
+        if missing_api:
+            print(
+                f"WARNING: {doc_path.name} does not reference enforcer API: "
+                f"{missing_api}"
+            )
+        if EVENT_BUDGET_MARKER not in doc:
+            print(
+                f"WARNING: {doc_path.name} does not reference the "
+                f"{EVENT_BUDGET_MARKER} event budget"
+            )
+
+    return True
+
+
 def main() -> int:
     passed = True
 
@@ -193,6 +273,10 @@ def main() -> int:
 
     print("Checking error.md discriminant alignment...")
     if not check_error_alignment():
+        passed = False
+
+    print("Checking event-byte-budget.py docstrings and markdown references...")
+    if not check_event_byte_budget_docs():
         passed = False
 
     if passed:

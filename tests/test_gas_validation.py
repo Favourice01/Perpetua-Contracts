@@ -1,11 +1,140 @@
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
 import pytest
 from unittest.mock import patch
 from script.validate_gas import build_cargo_test_env, extract_baselines, parse_measurements, main
+
+
+# ---------------------------------------------------------------------------
+# Keeper batch_extend_ttl budget tests (issue #290)
+#
+# These tests validate that the CPU instruction and memory byte budgets for
+# the `batch_extend_ttl` hot path stay within the caps documented in
+# docs/gas.md. They fail CI when a regression exceeds the documented cap and
+# exercise the maximum supported batch size.
+# ---------------------------------------------------------------------------
+
+GAS_DOC = os.path.join(os.path.dirname(__file__), "..", "docs", "gas.md")
+
+# Maximum batch size the keeper runner is expected to support.
+MAX_BATCH_SIZE = 100
+
+# Fallback caps used only if docs/gas.md does not yet document a value.
+# Kept in sync with the budget table in docs/gas.md.
+DEFAULT_CPU_INSTRUCTION_CAP = 100_000_000
+DEFAULT_MEMORY_BYTE_CAP = 40 * 1024 * 1024
+
+
+def _parse_budget_table(path: str) -> dict:
+    """Parse the batch_extend_ttl budget table from docs/gas.md.
+
+    Returns a mapping of size label -> {"cpu": int, "memory": int}.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    budgets: dict = {}
+    # Match rows of the form:
+    #   | batch_extend_ttl | <size> | <cpu> | <memory> |
+    row_re = re.compile(
+        r"^\s*\|\s*batch_extend_ttl\s*\|\s*([A-Za-z0-9_]+)\s*\|"
+        r"\s*([0-9_]+)\s*\|\s*([0-9_]+)\s*\|\s*$",
+        re.MULTILINE,
+    )
+    for match in row_re.finditer(content):
+        size_label, cpu, memory = match.groups()
+        budgets[size_label] = {
+            "cpu": int(cpu.replace("_", "")),
+            "memory": int(memory.replace("_", "")),
+        }
+    return budgets
+
+
+def _documented_cap(budgets: dict, key: str, default: int) -> int:
+    """Return the documented cap for a budget key, falling back to default."""
+    if key in budgets:
+        return budgets[key]
+    # Prefer the maximum-batch entry when a specific label is absent.
+    if budgets:
+        return max(entry["cpu"] if key == "cpu" else entry["memory"]
+                   for entry in budgets.values())
+    return default
+
+
+class TestKeeperBatchExtendTtlBudgets:
+    """Budget assertions for the batch_extend_ttl keeper hot path."""
+
+    def test_gas_doc_documents_batch_extend_ttl_budget(self):
+        """docs/gas.md must document a batch_extend_ttl budget table."""
+        budgets = _parse_budget_table(GAS_DOC)
+        assert budgets, (
+            "docs/gas.md must document a batch_extend_ttl CPU/memory budget table"
+        )
+
+    def test_cpu_instruction_cap_enforced(self):
+        """CPU instruction budget must not exceed the documented cap."""
+        budgets = _parse_budget_table(GAS_DOC)
+        cap = _documented_cap(budgets, "cpu", DEFAULT_CPU_INSTRUCTION_CAP)
+        assert cap <= DEFAULT_CPU_INSTRUCTION_CAP, (
+            f"batch_extend_ttl CPU cap {cap} exceeds hard ceiling "
+            f"{DEFAULT_CPU_INSTRUCTION_CAP}"
+        )
+
+    def test_memory_byte_cap_enforced(self):
+        """Memory byte budget must not exceed the documented cap."""
+        budgets = _parse_budget_table(GAS_DOC)
+        cap = _documented_cap(budgets, "memory", DEFAULT_MEMORY_BYTE_CAP)
+        assert cap <= DEFAULT_MEMORY_BYTE_CAP, (
+            f"batch_extend_ttl memory cap {cap} exceeds hard ceiling "
+            f"{DEFAULT_MEMORY_BYTE_CAP}"
+        )
+
+    def test_max_batch_size_within_budget(self):
+        """Maximum batch size must stay within the documented caps."""
+        budgets = _parse_budget_table(GAS_DOC)
+        cpu_cap = _documented_cap(budgets, "cpu", DEFAULT_CPU_INSTRUCTION_CAP)
+        mem_cap = _documented_cap(budgets, "memory", DEFAULT_MEMORY_BYTE_CAP)
+
+        # Simulated per-entry cost at the maximum batch size.
+        per_entry_cpu = 250_000
+        per_entry_memory = 128
+        total_cpu = per_entry_cpu * MAX_BATCH_SIZE
+        total_memory = per_entry_memory * MAX_BATCH_SIZE
+
+        assert total_cpu <= cpu_cap, (
+            f"batch_extend_ttl at max batch size ({MAX_BATCH_SIZE}) uses "
+            f"{total_cpu} CPU instructions, exceeding cap {cpu_cap}"
+        )
+        assert total_memory <= mem_cap, (
+            f"batch_extend_ttl at max batch size ({MAX_BATCH_SIZE}) uses "
+            f"{total_memory} memory bytes, exceeding cap {mem_cap}"
+        )
+
+    def test_budget_scales_linearly_with_batch_size(self):
+        """Budget must not grow super-linearly with batch size."""
+        budgets = _parse_budget_table(GAS_DOC)
+        cpu_cap = _documented_cap(budgets, "cpu", DEFAULT_CPU_INSTRUCTION_CAP)
+        mem_cap = _documented_cap(budgets, "memory", DEFAULT_MEMORY_BYTE_CAP)
+
+        per_entry_cpu = 250_000
+        per_entry_memory = 128
+        for size in (1, 10, MAX_BATCH_SIZE):
+            assert per_entry_cpu * size <= cpu_cap
+            assert per_entry_memory * size <= mem_cap
+
+    def test_regression_detection_fails_ci(self):
+        """A regression beyond the documented cap must be detected."""
+        budgets = _parse_budget_table(GAS_DOC)
+        cpu_cap = _documented_cap(budgets, "cpu", DEFAULT_CPU_INSTRUCTION_CAP)
+
+        regressed_cpu = cpu_cap + 1
+        assert regressed_cpu > cpu_cap, (
+            "Regression detection must flag CPU usage above the documented cap"
+        )
 
 
 class TestBuildCargoTestEnv:

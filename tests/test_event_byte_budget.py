@@ -17,9 +17,12 @@ that silently would be exactly the kind of drift these tests exist to catch.
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -112,3 +115,179 @@ class TestScriptRuns:
         )
         assert result.returncode == 0, result.stderr
         assert "withdrawn" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Boundary cliffs at the 16 KiB ledger bound (issue #288).
+# ---------------------------------------------------------------------------
+
+class TestBoundaryCliffs:
+    """The Protocol 27 bound is a strict `<` on the SUM of event bytes.
+    Exactly 16,384 must be rejected; 16,383 must be accepted."""
+
+    def test_exactly_at_the_limit_is_rejected(self):
+        assert ebb.check_budget(ebb.MAX_EVENT_BYTES)["ok"] is False
+
+    def test_one_byte_under_the_limit_is_accepted(self):
+        assert ebb.check_budget(ebb.MAX_EVENT_BYTES - 1)["ok"] is True
+
+    def test_one_byte_over_the_limit_is_rejected(self):
+        assert ebb.check_budget(ebb.MAX_EVENT_BYTES + 1)["ok"] is False
+
+    def test_zero_bytes_is_accepted(self):
+        assert ebb.check_budget(0)["ok"] is True
+
+    def test_negative_bytes_is_rejected(self):
+        assert ebb.check_budget(-1)["ok"] is False
+
+    def test_headroom_is_exact_at_the_boundary(self):
+        assert ebb.check_budget(ebb.MAX_EVENT_BYTES - 1)["headroom"] == 1
+        assert ebb.check_budget(ebb.MAX_EVENT_BYTES)["headroom"] == 0
+
+    def test_full_batch_withdraw_is_accepted(self):
+        used = SIZES["withdrawn"]["total"] * ebb.MAX_BATCH_SIZE
+        assert ebb.check_budget(used)["ok"] is True
+
+    def test_batch_over_max_batch_size_is_rejected(self):
+        used = SIZES["withdrawn"]["total"] * (ebb.MAX_BATCH_SIZE + 1)
+        assert ebb.check_budget(used)["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Error codes (issue #288): every branch must be reachable and stable.
+# ---------------------------------------------------------------------------
+
+class TestErrorCodes:
+    def test_error_codes_are_unique(self):
+        codes = [c for c in dir(ebb) if c.startswith("ERR_")]
+        assert codes, "event-byte-budget.py must expose ERR_* constants"
+        values = [getattr(ebb, c) for c in codes]
+        assert len(values) == len(set(values))
+
+    def test_oversize_budget_emits_its_error_code(self):
+        result = ebb.check_budget(ebb.MAX_EVENT_BYTES + 1)
+        assert result["ok"] is False
+        assert result["error"] == ebb.ERR_EVENT_BUDGET_EXCEEDED
+
+    def test_negative_budget_emits_its_error_code(self):
+        result = ebb.check_budget(-1)
+        assert result["ok"] is False
+        assert result["error"] == ebb.ERR_INVALID_BYTE_COUNT
+
+    def test_unknown_event_emits_its_error_code(self):
+        result = ebb.check_event("no_such_event")
+        assert result["ok"] is False
+        assert result["error"] == ebb.ERR_UNKNOWN_EVENT
+
+    def test_archived_entry_emits_its_error_code(self):
+        result = ebb.classify_entry(stream_id=1, stream_count=16, present=False)
+        assert result["ok"] is False
+        assert result["error"] == ebb.ERR_ARCHIVED_ENTRY
+
+    def test_ledger_skew_emits_its_error_code(self):
+        result = ebb.classify_entry(
+            stream_id=1, stream_count=16, present=True, observed_ledger=100,
+            latest_ledger=90,
+        )
+        assert result["ok"] is False
+        assert result["error"] == ebb.ERR_LEDGER_SKEW
+
+    def test_every_error_code_is_documented(self):
+        doc = (_ROOT / "docs" / "soroban-rpc-read-skew.md").read_text()
+        for name in dir(ebb):
+            if name.startswith("ERR_"):
+                assert getattr(ebb, name) in doc, f"{name} missing from docs"
+
+
+# ---------------------------------------------------------------------------
+# Archival detection and restoration guidance (issue #287).
+# ---------------------------------------------------------------------------
+
+class TestArchivedEntryRecovery:
+    def test_archived_entry_is_classified_as_archived(self):
+        result = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
+        assert result["status"] == "Archived"
+
+    def test_archived_entry_emits_restoration_guidance(self):
+        result = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
+        assert "tools/sdk/restore_footprint.ts" in result["guidance"]
+
+    def test_live_entry_is_not_flagged(self):
+        result = ebb.classify_entry(stream_id=3, stream_count=16, present=True)
+        assert result["ok"] is True
+        assert result["status"] == "Live"
+
+    def test_stream_id_beyond_count_is_not_archived(self):
+        """A stream id >= stream_count() was never created; that is a
+        caller bug, not archival."""
+        result = ebb.classify_entry(stream_id=99, stream_count=16, present=False)
+        assert result["status"] != "Archived"
+
+    def test_recovery_is_idempotent(self):
+        first = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
+        second = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
+        assert first == second
+
+    def test_restoration_guidance_names_the_restore_tool(self):
+        result = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
+        assert re.search(r"restore_footprint\.ts", result["guidance"])
+
+
+# ---------------------------------------------------------------------------
+# RPC read skew (issue #287).
+# ---------------------------------------------------------------------------
+
+class TestLedgerSkew:
+    def test_stale_observation_is_rejected(self):
+        result = ebb.classify_entry(
+            stream_id=1, stream_count=16, present=True, observed_ledger=90,
+            latest_ledger=100,
+        )
+        assert result["ok"] is False
+        assert result["status"] == "LedgerSkew"
+
+    def test_current_observation_is_accepted(self):
+        result = ebb.classify_entry(
+            stream_id=1, stream_count=16, present=True, observed_ledger=100,
+            latest_ledger=100,
+        )
+        assert result["ok"] is True
+
+    def test_skew_beyond_tolerance_is_rejected(self):
+        result = ebb.classify_entry(
+            stream_id=1, stream_count=16, present=True,
+            observed_ledger=100 - ebb.MAX_LEDGER_SKEW - 1, latest_ledger=100,
+        )
+        assert result["ok"] is False
+
+    def test_skew_within_tolerance_is_accepted(self):
+        result = ebb.classify_entry(
+            stream_id=1, stream_count=16, present=True,
+            observed_ledger=100 - ebb.MAX_LEDGER_SKEW, latest_ledger=100,
+        )
+        assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Cross-module integration: factory, governance, SDK (issue #288).
+# ---------------------------------------------------------------------------
+
+class TestCrossModuleIntegration:
+    def test_sdk_error_codes_stay_in_sync(self):
+        """The enforcer's error codes must match tools/sdk/errors.ts so the
+        SDK can surface them without translation."""
+        sdk = (_ROOT / "tools" / "sdk" / "errors.ts").read_text()
+        for name in dir(ebb):
+            if name.startswith("ERR_"):
+                assert getattr(ebb, name) in sdk, f"{name} missing from SDK"
+
+    def test_factory_batch_size_matches_enforcer(self):
+        factory = (_ROOT / "contracts" / "factory" / "src" / "lib.rs").read_text()
+        assert "MAX_BATCH_SIZE" in factory or "batch_withdraw" in factory
+
+    def test_governance_docs_reference_the_enforcer(self):
+        gov = (_ROOT / "docs" / "soroban-rpc-read-skew.md").read_text()
+        assert "event-byte-budget.py" in gov
+
+    def test_restore_tool_exists(self):
+        assert (_ROOT / "tools" / "sdk" / "restore_footprint.ts").exists()

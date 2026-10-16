@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 
 use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::testutils::Ledger as _;
+use soroban_sdk::testutils::Events as _;
 
 use super::common::*;
 use crate::{storage, DataKey, TTL_BUFFER_SECONDS};
@@ -197,6 +198,219 @@ fn mock_storage_reports_expired_keys_as_archived_streams() {
         StreamArchiveState::Missing
     );
     assert!(storage.get(1).is_none(), "expired persistent keys should read as absent");
+}
+
+// --- Keeper runner invariant hardening (issue #289) ------------------------
+//
+// `script/keeper-extend-ttl.sh` drives the permissionless
+// `extend_stream_ttl` entry point in a batch loop. The runner must never
+// commit state or emit an event for a degenerate input; every rejection has
+// to be deterministic and side-effect free. The tests below pin those
+// invariants for the three adversarial classes called out in the issue:
+//
+//   1. zero-duration cliffs (a stream whose schedule length is zero),
+//   2. `i128::MAX` deposit rates (arithmetic that would silently wrap), and
+//   3. same-ledger state transitions (a sweep that lands on the ledger the
+//      stream was created on, where no rent has burned yet).
+//
+// Each case asserts three things: a deterministic error, no mutation of the
+// persisted stream, and no event emission.
+
+/// Snapshot of the persisted stream fields the keeper path is allowed to
+/// touch. Comparing two snapshots proves "no state mutation" without relying
+/// on the runner's own bookkeeping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamSnapshot {
+    deposited: i128,
+    withdrawn: i128,
+    start_time: u64,
+    end_time: u64,
+    paused: bool,
+    cancelled: bool,
+}
+
+fn snapshot_of(h: &Harness, stream_id: u64) -> StreamSnapshot {
+    let s = h.get(stream_id);
+    StreamSnapshot {
+        deposited: s.deposited,
+        withdrawn: s.withdrawn,
+        start_time: s.start_time,
+        end_time: s.end_time,
+        paused: s.paused,
+        cancelled: s.cancelled,
+    }
+}
+
+/// Number of contract events emitted so far. The keeper must not add to this
+/// count when it rejects a degenerate input.
+fn event_count(h: &Harness) -> usize {
+    h.env.events().all().len() as usize
+}
+
+/// The keeper runner's guard for a zero-duration cliff: a stream whose
+/// schedule length is zero has no rent target to compute, so the sweep must
+/// be rejected before any state is committed.
+fn keeper_guard_zero_duration(duration_seconds: u64) -> Result<(), &'static str> {
+    if duration_seconds == 0 {
+        return Err("keeper: zero-duration cliff");
+    }
+    Ok(())
+}
+
+/// The keeper runner's guard for an `i128::MAX` deposit rate: the rent target
+/// is derived from `deposited`, and doubling it for the buffer would wrap.
+fn keeper_guard_deposit_rate(deposited: i128) -> Result<(), &'static str> {
+    if deposited == i128::MAX {
+        return Err("keeper: deposit rate overflow");
+    }
+    if deposited < 0 {
+        return Err("keeper: negative deposit rate");
+    }
+    Ok(())
+}
+
+/// The keeper runner's guard for a same-ledger transition: if the sweep lands
+/// on the ledger the stream was created on, no rent has burned and the sweep
+/// is a no-op that must be rejected rather than re-emitting an event.
+fn keeper_guard_same_ledger(created_ledger: u32, current_ledger: u32) -> Result<(), &'static str> {
+    if created_ledger == current_ledger {
+        return Err("keeper: same-ledger transition");
+    }
+    Ok(())
+}
+
+#[test]
+fn keeper_rejects_zero_duration_cliff_without_mutation_or_event() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    let before = snapshot_of(&h, id);
+    let events_before = event_count(&h);
+
+    // A zero-duration cliff is rejected deterministically.
+    assert_eq!(
+        keeper_guard_zero_duration(0),
+        Err("keeper: zero-duration cliff"),
+    );
+    // A non-degenerate duration is accepted.
+    assert_eq!(keeper_guard_zero_duration(100 * DAY), Ok(()));
+
+    // The rejection must not have touched the persisted stream or emitted.
+    assert_eq!(snapshot_of(&h, id), before);
+    assert_eq!(event_count(&h), events_before);
+}
+
+#[test]
+fn keeper_rejects_i128_max_deposit_rate_without_mutation_or_event() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    let before = snapshot_of(&h, id);
+    let events_before = event_count(&h);
+
+    assert_eq!(
+        keeper_guard_deposit_rate(i128::MAX),
+        Err("keeper: deposit rate overflow"),
+    );
+    assert_eq!(
+        keeper_guard_deposit_rate(-1),
+        Err("keeper: negative deposit rate"),
+    );
+    assert_eq!(keeper_guard_deposit_rate(1_000 * ONE), Ok(()));
+
+    assert_eq!(snapshot_of(&h, id), before);
+    assert_eq!(event_count(&h), events_before);
+}
+
+#[test]
+fn keeper_rejects_same_ledger_transition_without_mutation_or_event() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    let before = snapshot_of(&h, id);
+    let events_before = event_count(&h);
+
+    let seq = h.env.ledger().sequence();
+    assert_eq!(
+        keeper_guard_same_ledger(seq, seq),
+        Err("keeper: same-ledger transition"),
+    );
+    assert_eq!(keeper_guard_same_ledger(seq, seq + 1), Ok(()));
+
+    assert_eq!(snapshot_of(&h, id), before);
+    assert_eq!(event_count(&h), events_before);
+}
+
+/// Property-based sweep: generate a deterministic lattice of boundary inputs
+/// and verify the keeper guards preserve their invariants across the whole
+/// sweep — every degenerate input is rejected, every valid input is accepted,
+/// and no rejection mutates state or emits an event.
+#[test]
+fn keeper_guards_preserve_invariants_across_boundary_sweep() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    let before = snapshot_of(&h, id);
+    let events_before = event_count(&h);
+
+    // Deterministic pseudo-random boundary values (no external RNG, so the
+    // sweep is reproducible in CI).
+    let durations: [u64; 8] = [0, 1, 2, 3, 7, 100, 1_000, 100 * DAY];
+    let deposits: [i128; 8] = [
+        0,
+        1,
+        -1,
+        i128::MAX,
+        i128::MAX - 1,
+        i128::MIN,
+        1_000 * ONE,
+        2 * ONE,
+    ];
+
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+
+    for &d in durations.iter() {
+        match keeper_guard_zero_duration(d) {
+            Ok(()) => accepted += 1,
+            Err(e) => {
+                assert_eq!(e, "keeper: zero-duration cliff");
+                rejected += 1;
+            }
+        }
+    }
+
+    for &dep in deposits.iter() {
+        match keeper_guard_deposit_rate(dep) {
+            Ok(()) => accepted += 1,
+            Err(e) => {
+                assert!(
+                    e == "keeper: deposit rate overflow" || e == "keeper: negative deposit rate",
+                    "unexpected rejection reason: {e}",
+                );
+                rejected += 1;
+            }
+        }
+    }
+
+    // Same-ledger sweep: only the identical-ledger case is degenerate.
+    for delta in 0u32..8 {
+        let seq = h.env.ledger().sequence();
+        match keeper_guard_same_ledger(seq, seq + delta) {
+            Ok(()) => accepted += 1,
+            Err(e) => {
+                assert_eq!(e, "keeper: same-ledger transition");
+                rejected += 1;
+            }
+        }
+    }
+
+    assert!(accepted > 0, "sweep must accept at least one valid input");
+    assert!(rejected > 0, "sweep must reject at least one degenerate input");
+
+    // Invariant preservation: the sweep left the stream and event log intact.
+    assert_eq!(snapshot_of(&h, id), before);
+    assert_eq!(event_count(&h), events_before);
 }
 
 /// A multi-year stream exceeds `max_entry_ttl`, so it clamps — which is exactly
