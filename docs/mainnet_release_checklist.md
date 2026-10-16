@@ -130,8 +130,34 @@ last successful run, and monitoring link in the evidence bundle.
 - [ ] The checkpoint, validation queries, sample transaction/event IDs, and
       verification output are attached to the evidence bundle.
 
+#### 6.1 Schema hardening gates
+
+- [ ] The `schemaVersion`/`abiVersion` marker in `schema/schema.graphql` matches
+      the deployed ABI exactly (no drift between Rust contracts, TypeScript SDK,
+      and GraphQL/SQL schemas).
+- [ ] Golden snapshot fixtures under `tests/fixtures/event_snapshots/` pass
+      `script/check_snapshot_diff.py` with zero diffs.
+- [ ] `script/verify_event_bytes.py` passes for every event/state schema.
+- [ ] `script/event-byte-budget.py` passes within the documented caps.
+- [ ] `script/validate-doc-alignment.py` passes with zero warnings.
+- [ ] Archival detection and idempotent retry paths are verified by automated
+      tests (archived entry restoration and ledger skew scenarios).
+- [ ] The CPU instruction and memory byte budget caps recorded in
+      [gas.md](gas.md) are met for `schema/schema.graphql` hot paths.
+
+Run the schema hardening gates with:
+
+```bash
+script/check_snapshot_diff.py
+script/verify_event_bytes.py
+script/event-byte-budget.py
+script/validate-doc-alignment.py
+script/check-stream-wasm-size.sh
+```
+
 The indexer must generate decoders from the deployed contract interface; do not
-hand-roll topic parsing. See [ABI](ABI.md) and the indexer migration notes in
+hand-roll topic parsing. See [ABI](ABI.md), the event reconstruction rules in
+[indexing_guide.md](indexing_guide.md), and the indexer migration notes in
 [MIGRATION.md](MIGRATION.md).
 
 ## Final launch sign-off

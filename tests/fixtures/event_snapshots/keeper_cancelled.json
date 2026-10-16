@@ -4,10 +4,13 @@
     {
       "topic": "cancelled",
       "data": {
-        "keeper": "GKEEPER",
-        "keeper_fee": 500000,
-        "recipient_amount": 8000000,
-        "refunded": 1000000
+        "stream_id": "STREAM_1",
+        "sender": "GSENDER",
+        "recipient": "GRECIPIENT",
+        "refunded": 1000000,
+        "vested": 8000000,
+        "withdrawn": 2000000,
+        "end_time": 1700000000
       }
     }
   ]

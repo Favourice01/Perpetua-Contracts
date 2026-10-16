@@ -74,6 +74,30 @@
 //! `vested - withdrawn` through the normal withdraw path, which is why that
 //! amount stays pooled in the contract. Every cancellation state is asserted
 //! against storage and token balances in `test::cancel_events`.
+//!
+//! # Off-chain schema parity
+//!
+//! The structs below are the single source of truth for the off-chain indexer.
+//! `schema/schema.graphql` (the subgraph schema) and `schema/schema.sql` (the
+//! SQL indexer schema) mirror these event structs **1:1**: every struct here has
+//! a matching GraphQL type and SQL table, and every field here has a matching
+//! column with the same name, order, and type mapping. The topic layout declared
+//! by `#[topic]` is likewise mirrored in the GraphQL `@entity` field annotations
+//! and the SQL index definitions.
+//!
+//! `script/abi-drift-check.py` enforces this parity in CI: it extracts the event
+//! schemas from the compiled contract spec and fails the build if the Rust
+//! structs, the GraphQL schema, and the SQL schema disagree on any field name,
+//! field order, or topic placement.
+//!
+//! ## Additive change rule
+//!
+//! Any additive change (a new field) **must append the trailing field in the
+//! Rust struct, the GraphQL schema, and the SQL schema in the same commit**.
+//! Appending in only one of the three places is a parity break and will be
+//! rejected by `script/abi-drift-check.py`. Reordering, removing, or re-topic-ing
+//! an existing field remains a breaking change and requires a `V2` struct as
+//! described above.
 use soroban_sdk::{contractevent, Address, Env};
 
 use crate::types::{Stream, StreamStatus};

@@ -15,7 +15,19 @@ SECURITY_FIELDS = {
     "auth", "auths", "require_auth", "signatures", "events", "topic",
     "topics", "data", "error", "error_code", "ContractError", "storage",
     "state", "DataKey",
+    # Off-chain indexer schema event fields (tests/fixtures/event_snapshots/)
+    "topic0", "stream_id", "payload", "archived", "event_index",
 }
+
+# Directories whose JSON snapshots are subject to the security diff gate.
+SNAPSHOT_DIRS = ("test_snapshots", "tests/fixtures/event_snapshots")
+
+
+def is_snapshot_path(path: str) -> bool:
+    """Return whether a path is a snapshot JSON covered by the diff gate."""
+    return path.endswith(".json") and any(
+        directory in path for directory in SNAPSHOT_DIRS
+    )
 
 
 def get_changed_files(base: str, head: str | None = None) -> list[str]:
@@ -31,7 +43,7 @@ def get_changed_files(base: str, head: str | None = None) -> list[str]:
 
     return [
         path for path in output.decode("utf-8").splitlines()
-        if path.endswith(".json") and "test_snapshots" in path
+        if is_snapshot_path(path)
     ]
 
 

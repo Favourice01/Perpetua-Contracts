@@ -306,6 +306,28 @@
       ]
     },
     {
+      "name": "DelegateGranted",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "grantor", "type": "Address"},
+        {"name": "delegate", "type": "Address"}
+      ],
+      "data": [
+        {"name": "ops", "type": "u32"},
+        {"name": "expires_at", "type": "Option<u64>"}
+      ]
+    },
+    {
+      "name": "DelegateRevoked",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "grantor", "type": "Address"},
+        {"name": "delegate", "type": "Address"}
+      ],
+      "data": [
+      ]
+    },
+    {
       "name": "Paused",
       "topics": [
         {"name": "stream_id", "type": "u64"},

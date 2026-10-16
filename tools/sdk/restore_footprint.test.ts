@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Account, Address, Keypair, Networks, xdr } from "@stellar/stellar-sdk";
 import {
   buildRestoreFootprintTransaction,
+  detectArchivedStream,
+  restoreAndRetry,
   restoreFootprintData,
   streamLedgerKey,
 } from "./restore_footprint";
@@ -71,5 +73,157 @@ describe("RestoreFootprint stream footprint", () => {
     transaction.sign(keypair);
     expect(transaction.toXDR()).toContain("AAAA");
     expect(transaction.operations).toHaveLength(1);
+  });
+});
+
+describe("detectArchivedStream", () => {
+  const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+  it("reports archived when the entry is missing but the contract exists", async () => {
+    const readEntry = vi.fn().mockResolvedValue(null);
+    const readContract = vi.fn().mockResolvedValue({ id: CONTRACT });
+
+    const result = await detectArchivedStream({
+      contractId: CONTRACT,
+      streamId: 42n,
+      readEntry,
+      readContract,
+    });
+
+    expect(result).toEqual({ status: "archived", streamId: 42n });
+    expect(readEntry).toHaveBeenCalledTimes(1);
+    expect(readContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports never-existed when both the entry and contract are missing", async () => {
+    const readEntry = vi.fn().mockResolvedValue(null);
+    const readContract = vi.fn().mockResolvedValue(null);
+
+    const result = await detectArchivedStream({
+      contractId: CONTRACT,
+      streamId: 7n,
+      readEntry,
+      readContract,
+    });
+
+    expect(result).toEqual({ status: "never-existed", streamId: 7n });
+  });
+
+  it("reports live when the entry is present", async () => {
+    const readEntry = vi.fn().mockResolvedValue({ balance: 100n });
+    const readContract = vi.fn();
+
+    const result = await detectArchivedStream({
+      contractId: CONTRACT,
+      streamId: 42n,
+      readEntry,
+      readContract,
+    });
+
+    expect(result).toEqual({ status: "live", streamId: 42n });
+    expect(readContract).not.toHaveBeenCalled();
+  });
+});
+
+describe("restoreAndRetry idempotency", () => {
+  const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+  it("restores and retries once when the entry is archived", async () => {
+    const restore = vi.fn().mockResolvedValue(undefined);
+    const invoke = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("entry archived"))
+      .mockResolvedValueOnce("ok");
+
+    const result = await restoreAndRetry({
+      contractId: CONTRACT,
+      streamId: 42n,
+      invoke,
+      restore,
+    });
+
+    expect(result).toBe("ok");
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("is a no-op when re-run after a successful restore", async () => {
+    const restore = vi.fn().mockResolvedValue(undefined);
+    const invoke = vi.fn().mockResolvedValue("ok");
+
+    const first = await restoreAndRetry({
+      contractId: CONTRACT,
+      streamId: 42n,
+      invoke,
+      restore,
+    });
+    const second = await restoreAndRetry({
+      contractId: CONTRACT,
+      streamId: 42n,
+      invoke,
+      restore,
+    });
+
+    expect(first).toBe("ok");
+    expect(second).toBe("ok");
+    expect(restore).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not restore when the invocation succeeds on the first try", async () => {
+    const restore = vi.fn().mockResolvedValue(undefined);
+    const invoke = vi.fn().mockResolvedValue("ok");
+
+    const result = await restoreAndRetry({
+      contractId: CONTRACT,
+      streamId: 42n,
+      invoke,
+      restore,
+    });
+
+    expect(result).toBe("ok");
+    expect(restore).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("restoreAndRetry ledger skew", () => {
+  const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+  it("retries when latestLedger disagrees across reads", async () => {
+    const ledgers = [100, 101, 101];
+    const readLatestLedger = vi.fn(() => ledgers.shift() ?? 101);
+    const restore = vi.fn().mockResolvedValue(undefined);
+    const invoke = vi.fn().mockResolvedValue("ok");
+
+    const result = await restoreAndRetry({
+      contractId: CONTRACT,
+      streamId: 42n,
+      invoke,
+      restore,
+      readLatestLedger,
+    });
+
+    expect(result).toBe("ok");
+    expect(readLatestLedger).toHaveBeenCalledTimes(3);
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up deterministically when skew persists", async () => {
+    const readLatestLedger = vi.fn(() => 100);
+    const restore = vi.fn().mockResolvedValue(undefined);
+    const invoke = vi.fn().mockResolvedValue("ok");
+
+    await expect(
+      restoreAndRetry({
+        contractId: CONTRACT,
+        streamId: 42n,
+        invoke,
+        restore,
+        readLatestLedger,
+        maxSkewRetries: 2,
+      }),
+    ).rejects.toThrow(/ledger skew/i);
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

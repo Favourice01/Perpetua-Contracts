@@ -17,11 +17,15 @@ that silently would be exactly the kind of drift these tests exist to catch.
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
+
+_SCHEMA = _ROOT / "schema" / "schema.graphql"
+_WASM_SIZE_SCRIPT = _ROOT / "script" / "check-stream-wasm-size.sh"
 
 
 def _load(name: str):
@@ -112,3 +116,81 @@ class TestScriptRuns:
         )
         assert result.returncode == 0, result.stderr
         assert "withdrawn" in result.stdout
+
+
+def _schema_event_types() -> set:
+    """Event type names declared in schema/schema.graphql.
+
+    The off-chain schema mirrors the on-chain event set; every event the
+    contract can emit must have a byte-budget entry so the ledger bound
+    stays verifiable end to end.
+    """
+    text = _SCHEMA.read_text()
+    return set(re.findall(r"^\s*type\s+(\w+Event)\b", text, re.MULTILINE))
+
+
+class TestSchemaParity:
+    """Issue #295/#296: the off-chain schema must not drift from the
+    byte-budget model. A new event type added to the schema without a
+    matching budget entry is a hard failure."""
+
+    def test_schema_declares_event_types(self):
+        assert _schema_event_types(), "no *Event types found in schema.graphql"
+
+    def test_every_schema_event_has_a_budget_entry(self):
+        missing = sorted(_schema_event_types() - set(SIZES))
+        assert not missing, (
+            "schema/schema.graphql declares event types with no byte-budget "
+            f"entry: {missing}. Add them to script/event-byte-budget.py."
+        )
+
+    def test_no_budget_entry_is_orphaned(self):
+        """The reverse direction: a budget entry with no schema type means
+        the schema dropped an event the model still measures."""
+        orphaned = sorted(set(SIZES) - _schema_event_types())
+        assert not orphaned, (
+            f"byte-budget entries with no schema event type: {orphaned}"
+        )
+
+
+class TestStrictUpperBoundCaps:
+    """Pin the strict upper-bound caps for the off-chain schema."""
+
+    def test_batch_withdraw_plus_stream_created_under_cap(self):
+        """Worst realistic combination: a full batch_withdraw (16 x
+        withdrawn) plus the stream_created that opened the batch."""
+        used = (
+            SIZES["withdrawn"]["total"] * ebb.MAX_BATCH_SIZE
+            + SIZES["stream_created"]["total"]
+        )
+        assert used < ebb.MAX_EVENT_BYTES, (
+            f"batch_withdraw + stream_created = {used} bytes, "
+            f"over the {ebb.MAX_EVENT_BYTES}-byte Protocol 27 cap"
+        )
+
+    def test_combination_cap_is_16384(self):
+        assert ebb.MAX_EVENT_BYTES == 16_384
+
+    def test_combination_leaves_headroom(self):
+        used = (
+            SIZES["withdrawn"]["total"] * ebb.MAX_BATCH_SIZE
+            + SIZES["stream_created"]["total"]
+        )
+        assert ebb.MAX_EVENT_BYTES - used > 9_000
+
+
+class TestWasmSizeBudget:
+    def test_wasm_size_check_script_exists(self):
+        assert _WASM_SIZE_SCRIPT.exists(), (
+            f"missing {_WASM_SIZE_SCRIPT}; the WASM size budget check must "
+            "remain runnable in CI"
+        )
+
+    def test_wasm_size_check_passes(self):
+        result = subprocess.run(
+            ["bash", str(_WASM_SIZE_SCRIPT)],
+            capture_output=True,
+            text=True,
+            cwd=str(_ROOT),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr

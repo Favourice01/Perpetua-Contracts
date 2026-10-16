@@ -31,6 +31,7 @@ Security guarantees under test
 """
 
 import copy
+import glob
 import json
 import subprocess
 import sys
@@ -47,6 +48,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'script'))
 import check_snapshot_diff  # noqa: E402
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), 'fixtures', 'event_snapshots')
+
+# ---------------------------------------------------------------------------
+# Off-chain schema snapshot paths
+# ---------------------------------------------------------------------------
+# The off-chain subgraph / SQL indexer schema lives in ``schema/schema.graphql``
+# and its golden JSON snapshot fixtures live under
+# ``tests/fixtures/event_snapshots/``.  These paths must be treated as
+# security-relevant by the snapshot-diff gate so that any drift in the
+# off-chain schema surfaces in CI.
+OFFCHAIN_SNAPSHOT_DIR = 'tests/fixtures/event_snapshots'
+
+# Field names that are security-relevant for the off-chain schema snapshots.
+# ``topic0`` is the keccak/topic-0 discriminator, ``stream_id`` identifies the
+# stream, ``payload`` carries the decoded event body, ``archived`` marks
+# tombstoned rows, and ``event_index`` orders events within a ledger.
+OFFCHAIN_SECURITY_FIELDS = (
+    'topic0',
+    'stream_id',
+    'payload',
+    'archived',
+    'event_index',
+)
+
+# Marker keys that pin the schema/ABI version.  Any change to these values is
+# schema drift and must fail CI.
+SCHEMA_VERSION_MARKER = 'schemaVersion'
+ABI_VERSION_MARKER = 'abiVersion'
 
 
 def _load_fixture(name):
@@ -137,6 +165,33 @@ class TestIsSecurityRelevant:
             'storage', 'state', 'DataKey',
         }
         assert required.issubset(check_snapshot_diff.SECURITY_FIELDS)
+
+    # --- off-chain schema fields must be security-relevant ---
+    @pytest.mark.parametrize("path", [
+        "topic0",
+        "events[0].topic0",
+        "stream_id",
+        "events[0].stream_id",
+        "payload",
+        "events[0].payload",
+        "archived",
+        "events[0].archived",
+        "event_index",
+        "events[0].event_index",
+        # Nested deeply
+        "a.b.c.topic0",
+        "root[0].payload[1].stream_id",
+    ])
+    def test_offchain_schema_fields_are_security_relevant(self, path):
+        """topic0/stream_id/payload/archived/event_index gate the diff."""
+        assert check_snapshot_diff.is_security_relevant(path) is True
+
+    def test_offchain_security_fields_are_in_security_fields_set(self):
+        """Every off-chain schema field must be a member of SECURITY_FIELDS."""
+        for field in OFFCHAIN_SECURITY_FIELDS:
+            assert field in check_snapshot_diff.SECURITY_FIELDS, (
+                f"off-chain schema field {field!r} missing from SECURITY_FIELDS"
+            )
 
 
 # ===========================================================================
@@ -267,6 +322,30 @@ class TestGetChangedFiles:
     def test_empty_output_returns_empty_list(self, mock_co):
         mock_co.return_value = b""
         assert check_snapshot_diff.get_changed_files("HEAD", "HEAD") == []
+
+    @patch('subprocess.check_output')
+    def test_detects_offchain_event_snapshot_changes(self, mock_co):
+        """Changes under tests/fixtures/event_snapshots/*.json are detected."""
+        mock_co.return_value = (
+            b"tests/fixtures/event_snapshots/keeper_cancelled.json\n"
+            b"tests/fixtures/event_snapshots/stream_cloned.json\n"
+            b"schema/schema.graphql\n"
+        )
+        files = check_snapshot_diff.get_changed_files("HEAD~1", "HEAD")
+        assert files == [
+            "tests/fixtures/event_snapshots/keeper_cancelled.json",
+            "tests/fixtures/event_snapshots/stream_cloned.json",
+        ]
+
+    @patch('subprocess.check_output')
+    def test_offchain_snapshot_dir_excludes_non_json(self, mock_co):
+        """Non-JSON files in the off-chain snapshot dir are excluded."""
+        mock_co.return_value = (
+            b"tests/fixtures/event_snapshots/README.md\n"
+            b"tests/fixtures/event_snapshots/keeper_cancelled.json\n"
+        )
+        files = check_snapshot_diff.get_changed_files("HEAD~1", "HEAD")
+        assert files == ["tests/fixtures/event_snapshots/keeper_cancelled.json"]
 
 
 # ===========================================================================
@@ -665,6 +744,199 @@ class TestRealEventFixtures:
         diffs = check_snapshot_diff.get_diff_paths(old, new)
         assert diffs == ['ledger_sequence']
         assert not any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+
+# ===========================================================================
+# Off-chain schema snapshots — golden fixtures for all event types
+# ===========================================================================
+#
+# These tests validate the golden JSON fixtures under
+# ``tests/fixtures/event_snapshots/`` that mirror the off-chain subgraph / SQL
+# indexer schema in ``schema/schema.graphql``.  Every event type must have a
+# fixture, and every fixture must carry the schemaVersion/abiVersion markers
+# so that schema drift fails CI.
+
+class TestOffchainSchemaSnapshots:
+    """Golden fixture validation for the off-chain schema snapshots."""
+
+    def _all_fixture_paths(self):
+        return sorted(glob.glob(os.path.join(FIXTURES_DIR, '*.json')))
+
+    def test_fixture_directory_exists(self):
+        assert os.path.isdir(FIXTURES_DIR), (
+            f"off-chain snapshot fixture dir missing: {FIXTURES_DIR}"
+        )
+
+    def test_at_least_one_golden_fixture_present(self):
+        assert self._all_fixture_paths(), (
+            "no golden event snapshot fixtures found under "
+            f"{OFFCHAIN_SNAPSHOT_DIR}"
+        )
+
+    @pytest.mark.parametrize("fixture_path", sorted(
+        glob.glob(os.path.join(FIXTURES_DIR, '*.json'))
+    ))
+    def test_fixture_is_valid_json_object(self, fixture_path):
+        with open(fixture_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert isinstance(data, dict), f"{fixture_path} must be a JSON object"
+
+    @pytest.mark.parametrize("fixture_path", sorted(
+        glob.glob(os.path.join(FIXTURES_DIR, '*.json'))
+    ))
+    def test_fixture_pins_schema_and_abi_version(self, fixture_path):
+        """Regression: schemaVersion/abiVersion markers must be present."""
+        with open(fixture_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert SCHEMA_VERSION_MARKER in data, (
+            f"{fixture_path} missing {SCHEMA_VERSION_MARKER!r} marker"
+        )
+        assert ABI_VERSION_MARKER in data, (
+            f"{fixture_path} missing {ABI_VERSION_MARKER!r} marker"
+        )
+
+    @pytest.mark.parametrize("fixture_path", sorted(
+        glob.glob(os.path.join(FIXTURES_DIR, '*.json'))
+    ))
+    def test_fixture_events_carry_offchain_security_fields(self, fixture_path):
+        """Each event entry must expose the off-chain schema field names."""
+        with open(fixture_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        events = data.get('events')
+        assert isinstance(events, list) and events, (
+            f"{fixture_path} must contain a non-empty 'events' list"
+        )
+        for idx, event in enumerate(events):
+            for field in OFFCHAIN_SECURITY_FIELDS:
+                assert field in event, (
+                    f"{fixture_path} events[{idx}] missing off-chain field "
+                    f"{field!r}"
+                )
+
+    def test_schema_version_drift_is_detected(self):
+        """Regression: bumping schemaVersion must surface as a diff."""
+        old = _load_fixture('keeper_cancelled.json')
+        new = copy.deepcopy(old)
+        new[SCHEMA_VERSION_MARKER] = str(old[SCHEMA_VERSION_MARKER]) + '-drift'
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert SCHEMA_VERSION_MARKER in diffs
+
+    def test_abi_version_drift_is_detected(self):
+        """Regression: bumping abiVersion must surface as a diff."""
+        old = _load_fixture('keeper_cancelled.json')
+        new = copy.deepcopy(old)
+        new[ABI_VERSION_MARKER] = str(old[ABI_VERSION_MARKER]) + '-drift'
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert ABI_VERSION_MARKER in diffs
+
+    def test_topic0_change_is_security_relevant(self):
+        old = _load_fixture('keeper_cancelled.json')
+        new = copy.deepcopy(old)
+        new['events'][0]['topic0'] = '0xdeadbeef'
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events[0].topic0' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    def test_stream_id_change_is_security_relevant(self):
+        old = _load_fixture('stream_cloned.json')
+        new = copy.deepcopy(old)
+        new['events'][0]['stream_id'] = 'stream-9999'
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events[0].stream_id' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    def test_payload_change_is_security_relevant(self):
+        old = _load_fixture('stream_cloned.json')
+        new = copy.deepcopy(old)
+        new['events'][0]['payload'] = {'mutated': True}
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events[0].payload' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    def test_archived_flag_change_is_security_relevant(self):
+        old = _load_fixture('stream_cloned.json')
+        new = copy.deepcopy(old)
+        new['events'][0]['archived'] = not old['events'][0]['archived']
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events[0].archived' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    def test_event_index_change_is_security_relevant(self):
+        old = _load_fixture('stream_cloned.json')
+        new = copy.deepcopy(old)
+        new['events'][0]['event_index'] = old['events'][0]['event_index'] + 1
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events[0].event_index' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+
+# ===========================================================================
+# End-to-end: off-chain snapshot changes across real commits
+# ===========================================================================
+
+class TestOffchainSnapshotsEndToEnd:
+    """main() detects off-chain schema snapshot drift across real commits."""
+
+    def _init_repo(self, path):
+        _run_git(['init', '-q'], cwd=path)
+
+    def test_offchain_snapshot_security_change_exits_1(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        repo = str(tmp_path)
+        self._init_repo(repo)
+
+        rel_path = f'{OFFCHAIN_SNAPSHOT_DIR}/keeper_cancelled.json'
+        baseline = _load_fixture('keeper_cancelled.json')
+        base_sha = _commit_snapshot(repo, rel_path, baseline)
+
+        mutated = copy.deepcopy(baseline)
+        mutated['events'][0]['topic0'] = '0xdeadbeef'
+        head_sha = _commit_snapshot(repo, rel_path, mutated)
+
+        monkeypatch.chdir(repo)
+        with patch('sys.argv', ['check_snapshot_diff.py',
+                                 '--base', base_sha, '--head', head_sha]):
+            with pytest.raises(SystemExit) as exc:
+                check_snapshot_diff.main()
+
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'Security-relevant fields changed' in out
+        assert rel_path in out
+
+    def test_offchain_snapshot_version_marker_drift_exits_1(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Regression: schemaVersion/abiVersion drift must fail CI."""
+        repo = str(tmp_path)
+        self._init_repo(repo)
+
+        rel_path = f'{OFFCHAIN_SNAPSHOT_DIR}/stream_cloned.json'
+        baseline = _load_fixture('stream_cloned.json')
+        base_sha = _commit_snapshot(repo, rel_path, baseline)
+
+        mutated = copy.deepcopy(baseline)
+        mutated[SCHEMA_VERSION_MARKER] = '9999'
+        mutated[ABI_VERSION_MARKER] = '9999'
+        head_sha = _commit_snapshot(repo, rel_path, mutated)
+
+        monkeypatch.chdir(repo)
+        with patch('sys.argv', ['check_snapshot_diff.py',
+                                 '--base', base_sha, '--head', head_sha]):
+            with pytest.raises(SystemExit) as exc:
+                check_snapshot_diff.main()
+
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'Security-relevant fields changed' in out
 
 
 # ===========================================================================

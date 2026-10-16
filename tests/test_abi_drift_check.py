@@ -114,6 +114,82 @@ def repo(tmp_path, monkeypatch):
     return tmp_path
 
 
+# ---------------------------------------------------------------------------
+# Off-chain schema parity fixtures
+# ---------------------------------------------------------------------------
+
+SCHEMA_GRAPHQL = """\
+# schema/schema.graphql
+schemaVersion: 3
+abiVersion: 3
+
+type StreamCreated @entity {
+  id: ID!
+  streamId: BigInt!
+  sender: Bytes!
+  recipient: Bytes!
+  token: Bytes!
+  deposited: BigInt!
+}
+
+type Withdrawn @entity {
+  id: ID!
+  streamId: BigInt!
+  recipient: Bytes!
+  amount: BigInt!
+  withdrawn: BigInt!
+}
+"""
+
+SCHEMA_SQL = """\
+-- schema/schema.sql
+-- schemaVersion: 3
+-- abiVersion: 3
+
+CREATE TABLE stream_created (
+  id TEXT PRIMARY KEY,
+  stream_id BIGINT NOT NULL,
+  sender BYTEA NOT NULL,
+  recipient BYTEA NOT NULL,
+  token BYTEA NOT NULL,
+  deposited NUMERIC NOT NULL
+);
+
+CREATE TABLE withdrawn (
+  id TEXT PRIMARY KEY,
+  stream_id BIGINT NOT NULL,
+  recipient BYTEA NOT NULL,
+  amount NUMERIC NOT NULL,
+  withdrawn NUMERIC NOT NULL
+);
+"""
+
+
+@pytest.fixture
+def schema_repo(tmp_path, monkeypatch):
+    """Synthetic repo tree carrying the off-chain GraphQL/SQL schemas."""
+    stream = tmp_path / "contracts" / "stream" / "src"
+    stream.mkdir(parents=True)
+    (stream / "events.rs").write_text(EVENTS_RS, encoding="utf-8")
+    (stream / "lib.rs").write_text(LIB_RS, encoding="utf-8")
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "ABI.md").write_text(ABI_MD, encoding="utf-8")
+    schema = tmp_path / "schema"
+    schema.mkdir()
+    (schema / "schema.graphql").write_text(SCHEMA_GRAPHQL, encoding="utf-8")
+    (schema / "schema.sql").write_text(SCHEMA_SQL, encoding="utf-8")
+
+    monkeypatch.setattr(adc, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(adc, "STREAM_SRC", stream)
+    monkeypatch.setattr(adc, "EVENTS_RS", stream / "events.rs")
+    monkeypatch.setattr(adc, "LIB_RS", stream / "lib.rs")
+    monkeypatch.setattr(adc, "ABI_MD", docs / "ABI.md")
+    monkeypatch.setattr(adc, "SCHEMA_GRAPHQL", schema / "schema.graphql")
+    monkeypatch.setattr(adc, "SCHEMA_SQL", schema / "schema.sql")
+    return tmp_path
+
+
 def _edit(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
     assert old in text, f"fixture text not found: {old!r}"
@@ -344,6 +420,119 @@ class TestMain:
 
 
 # ---------------------------------------------------------------------------
+# Off-chain schema parity
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaParity:
+    """schema/schema.graphql and schema/schema.sql must mirror the ABI."""
+
+    def test_clean_schema_repo_passes(self, schema_repo, capsys):
+        assert adc.main([]) == 0
+        assert "OK" in capsys.readouterr().out
+
+    def test_reordered_topic_in_graphql_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.graphql",
+            "  streamId: BigInt!\n  sender: Bytes!\n  recipient: Bytes!",
+            "  streamId: BigInt!\n  recipient: Bytes!\n  sender: Bytes!",
+        )
+        assert adc.main([]) == 1
+        out = capsys.readouterr().out
+        assert "topic layout drifted" in out
+        assert "schema.graphql" in out
+
+    def test_reordered_topic_in_sql_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.sql",
+            "  stream_id BIGINT NOT NULL,\n  sender BYTEA NOT NULL,\n"
+            "  recipient BYTEA NOT NULL,",
+            "  stream_id BIGINT NOT NULL,\n  recipient BYTEA NOT NULL,\n"
+            "  sender BYTEA NOT NULL,",
+        )
+        assert adc.main([]) == 1
+        out = capsys.readouterr().out
+        assert "topic layout drifted" in out
+        assert "schema.sql" in out
+
+    def test_missing_event_type_in_graphql_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.graphql",
+            "type Withdrawn @entity {",
+            "type WithdrawalRequested @entity {",
+        )
+        assert adc.main([]) == 1
+        out = capsys.readouterr().out
+        assert "`withdrawn`" in out
+        assert "schema.graphql" in out
+
+    def test_missing_event_type_in_sql_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.sql",
+            "CREATE TABLE withdrawn (",
+            "CREATE TABLE withdrawal_requested (",
+        )
+        assert adc.main([]) == 1
+        out = capsys.readouterr().out
+        assert "`withdrawn`" in out
+        assert "schema.sql" in out
+
+    def test_changed_payload_field_in_graphql_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.graphql",
+            "  amount: BigInt!\n  withdrawn: BigInt!",
+            "  amount: BigInt!\n  withdrawnAmount: BigInt!",
+        )
+        assert adc.main([]) == 1
+        assert "payload layout drifted" in capsys.readouterr().out
+
+    def test_changed_payload_field_in_sql_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.sql",
+            "  amount NUMERIC NOT NULL,\n  withdrawn NUMERIC NOT NULL",
+            "  amount NUMERIC NOT NULL,\n  withdrawn_amount NUMERIC NOT NULL",
+        )
+        assert adc.main([]) == 1
+        assert "payload layout drifted" in capsys.readouterr().out
+
+    def test_schema_version_marker_drift_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.graphql",
+            "schemaVersion: 3",
+            "schemaVersion: 4",
+        )
+        assert adc.main([]) == 1
+        assert "schemaVersion" in capsys.readouterr().out
+
+    def test_abi_version_marker_drift_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.sql",
+            "-- abiVersion: 3",
+            "-- abiVersion: 2",
+        )
+        assert adc.main([]) == 1
+        assert "abiVersion" in capsys.readouterr().out
+
+    def test_topic0_mapping_matches_between_sql_and_graphql(self, schema_repo):
+        gql = adc.parse_graphql_schema(
+            (schema_repo / "schema" / "schema.graphql").read_text(encoding="utf-8")
+        )
+        sql = adc.parse_sql_schema(
+            (schema_repo / "schema" / "schema.sql").read_text(encoding="utf-8")
+        )
+        assert adc.topic0_mapping(gql) == adc.topic0_mapping(sql)
+
+    def test_topic0_mapping_drift_fails(self, schema_repo, capsys):
+        _edit(
+            schema_repo / "schema" / "schema.sql",
+            "CREATE TABLE withdrawn (",
+            "CREATE TABLE withdrawn_v2 (",
+        )
+        assert adc.main([]) == 1
+        assert "topic0" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # The real repository
 # ---------------------------------------------------------------------------
 
@@ -360,4 +549,24 @@ class TestRealRepository:
         events = adc.extract_events(adc.EVENTS_RS.read_text(encoding="utf-8"))
         rows, _ = adc.parse_abi_event_table(adc.ABI_MD.read_text(encoding="utf-8"))
         assert {e["name"] for e in events} == set(rows)
+
+    def test_real_schemas_match_abi(self):
+        findings, problems = adc.run_checks()
+        assert findings == [], f"schema drift in the real repo: {findings}"
+        assert problems == [], f"schema problems: {problems}"
+
+    def test_real_schema_version_markers_agree(self):
+        gql = adc.parse_graphql_schema(
+            adc.SCHEMA_GRAPHQL.read_text(encoding="utf-8")
+        )
+        sql = adc.parse_sql_schema(adc.SCHEMA_SQL.read_text(encoding="utf-8"))
+        assert gql["schemaVersion"] == sql["schemaVersion"]
+        assert gql["abiVersion"] == sql["abiVersion"]
+
+    def test_real_topic0_mapping_matches(self):
+        gql = adc.parse_graphql_schema(
+            adc.SCHEMA_GRAPHQL.read_text(encoding="utf-8")
+        )
+        sql = adc.parse_sql_schema(adc.SCHEMA_SQL.read_text(encoding="utf-8"))
+        assert adc.topic0_mapping(gql) == adc.topic0_mapping(sql)
 

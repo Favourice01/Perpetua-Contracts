@@ -90,6 +90,10 @@ def topics(elements):           # SCVec = SCV_VEC: disc(4) + ptr(4) + count(4)
 
 # --- The events, as declared in contracts/stream/src/events.rs ----------
 #
+# Each entry carries the matching GraphQL/SQL indexer type name from
+# `schema/schema.graphql` so the off-chain schema parity checks can pin the
+# same event set (see tests/test_event_byte_budget.py).
+#
 # Sizes are computed for a mid-life stream: u64 timestamps that have passed
 # a few years (~1.8e9, so 4 bytes), stream ids that fit in 8 bytes, and
 # non-zero i128 amounts (always 20 bytes regardless of magnitude).
@@ -99,9 +103,10 @@ ID = 1_000             # a mid-range stream id
 AMOUNT = 1_000_000_000_000   # 1e12, a large but ordinary token amount
 
 
-def _ev(name, topic_elems, pairs):
+def _ev(name, topic_elems, pairs, schema_type):
     return {
         "name": name,
+        "schema_type": schema_type,
         "topics": topics(topic_elems),
         "data": smap(pairs),
     }
@@ -125,50 +130,60 @@ EVENTS = [
          (sym("cliff_time"), u64(TS)),
          (sym("cancellable"), boolean(True)),
          (sym("pausable"), boolean(True)),
-         (sym("transferable"), boolean(True))]),
+         (sym("transferable"), boolean(True))],
+        "StreamCreated"),
 
     _ev("withdrawn",
         [_t_stream_id(), address()],
         [(sym("amount"), i128(AMOUNT)),
          (sym("withdrawn"), i128(AMOUNT)),
          (sym("deposited"), i128(AMOUNT)),
-         (sym("status"), u32(0))]),
+         (sym("status"), u32(0))],
+        "Withdrawn"),
 
     _ev("cancelled",
         [_t_stream_id(), _t_addr(), _t_addr()],
         [(sym("refunded"), i128(AMOUNT)),
          (sym("vested"), i128(AMOUNT)),
          (sym("withdrawn"), i128(AMOUNT)),
-         (sym("end_time"), u64(TS))]),
+         (sym("end_time"), u64(TS))],
+        "Cancelled"),
 
     _ev("paused",
         [_t_stream_id(), _t_addr()],
-        [(sym("paused_at"), u64(TS)), (sym("paused_total"), u64(TS))]),
+        [(sym("paused_at"), u64(TS)), (sym("paused_total"), u64(TS))],
+        "Paused"),
 
     _ev("resumed",
         [_t_stream_id(), _t_addr()],
-        [(sym("paused_duration"), u64(TS)), (sym("paused_total"), u64(TS))]),
+        [(sym("paused_duration"), u64(TS)), (sym("paused_total"), u64(TS))],
+        "Resumed"),
 
     _ev("topped_up",
         [_t_stream_id(), _t_addr()],
         [(sym("amount"), i128(AMOUNT)),
          (sym("deposited"), i128(AMOUNT)),
-         (sym("end_time"), u64(TS))]),
+         (sym("end_time"), u64(TS))],
+        "ToppedUp"),
 
     _ev("recipient_transferred",
-        [_t_stream_id(), _t_addr(), _t_addr()], []),
+        [_t_stream_id(), _t_addr(), _t_addr()], [],
+        "RecipientTransferred"),
 
     _ev("delegate_granted",
         [_t_stream_id(), _t_addr(), _t_addr()],
         [(sym("ops"), u32(0)),
-         (sym("expires_at"), option_u64(TS))]),
+         (sym("expires_at"), option_u64(TS))],
+        "DelegateGranted"),
 
     _ev("delegate_revoked",
-        [_t_stream_id(), _t_addr(), _t_addr()], []),
+        [_t_stream_id(), _t_addr(), _t_addr()], [],
+        "DelegateRevoked"),
 
     _ev("ttl_extended",
         [_t_stream_id()],
-        [(sym("extended_to_ledgers"), u32(0))]),
+        [(sym("extended_to_ledgers"), u32(0))],
+        "TtlExtended"),
 ]
 
 # ContractEvent framing, per the Soroban spec:
@@ -182,6 +197,7 @@ MAX_BATCH_SIZE = 16
 def sizes():
     return [
         {"name": e["name"],
+         "schema_type": e["schema_type"],
          "topics": e["topics"],
          "data": e["data"],
          "total": FRAME + e["topics"] + e["data"]}
@@ -189,7 +205,51 @@ def sizes():
     ]
 
 
+def batch_withdraw_total(batch_size=MAX_BATCH_SIZE):
+    """Strict upper bound for a full `batch_withdraw` event set.
+
+    `batch_withdraw` emits exactly one `withdrawn` event per stream drawn
+    from, so the worst case is `batch_size` copies of that event.
+    """
+    w = next(r["total"] for r in sizes() if r["name"] == "withdrawn")
+    return w * batch_size
+
+
+def batch_withdraw_plus_stream_created(batch_size=MAX_BATCH_SIZE):
+    """`batch_withdraw` plus one `stream_created`, the largest realistic batch."""
+    created = next(
+        r["total"] for r in sizes() if r["name"] == "stream_created"
+    )
+    return batch_withdraw_total(batch_size) + created
+
+
+def summary():
+    """Machine-readable per-event totals for tests and schema parity checks."""
+    rows = sizes()
+    return {
+        "max_event_bytes": MAX_EVENT_BYTES,
+        "max_batch_size": MAX_BATCH_SIZE,
+        "frame_bytes": FRAME,
+        "events": [
+            {
+                "name": r["name"],
+                "schema_type": r["schema_type"],
+                "topics": r["topics"],
+                "data": r["data"],
+                "total": r["total"],
+            }
+            for r in rows
+        ],
+        "batch_withdraw_total": batch_withdraw_total(),
+        "batch_withdraw_plus_stream_created": (
+            batch_withdraw_plus_stream_created()
+        ),
+    }
+
+
 if __name__ == "__main__":
+    import json
+
     rows = sizes()
     print(f"{'event':<24}{'topics':>7}{'data':>7}{'total':>7}")
     for r in rows:
@@ -215,8 +275,17 @@ if __name__ == "__main__":
     print(f"\n  even {fits} x {worst['name']} fit in one transaction "
           f"({worst['total'] * fits} bytes)")
 
-    combined = batch + next(
-        r["total"] for r in rows if r["name"] == "stream_created"
-    )
+    combined = batch_withdraw_plus_stream_created()
     print(f"\nfull batch_withdraw + stream_created = {combined} bytes "
           f"({combined / MAX_EVENT_BYTES:.2%} of budget)")
+
+    # Strict upper-bound cap for the off-chain indexer schema: the full
+    # batch_withdraw event set plus stream_created must stay under the
+    # Protocol 27 cap.
+    assert combined < MAX_EVENT_BYTES, (
+        f"batch_withdraw + stream_created = {combined} bytes exceeds the "
+        f"{MAX_EVENT_BYTES}-byte Protocol 27 cap"
+    )
+    print(f"  cap check: {combined} < {MAX_EVENT_BYTES} -> PASS")
+
+    print("\n" + json.dumps(summary(), indent=2, sort_keys=True))

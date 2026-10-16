@@ -1,5 +1,14 @@
 # Perpetua indexer schema — GraphQL (SubQuery / Envoy / custom indexers).
 #
+# This file is the single source of truth for the off-chain indexer. It is a
+# *declarative* indexer contract: it contains no runtime hot paths, no host
+# function invocations, and no XDR serialization of its own. CPU instruction
+# and linear-memory budgets are therefore bounded by the indexer's query
+# planner, not by this document. To keep batch payroll indexing within those
+# budgets, every connection query below carries a bounded `first` argument
+# (default 100, hard maximum 1000) so a caller can never request an unbounded
+# result set. See docs/gas.md for the byte/instruction budget tables.
+#
 # Mirrors contracts/stream/src/events.rs one-for-one. Every contract state
 # change emits exactly one event; topic[0] is the struct name in snake_case
 # and stream_id is always a topic, so all types below key off stream_id.
@@ -7,10 +16,27 @@
 # Versioning rule (from events.rs module docs): adding a field at the end of a
 # contract event is additive; reordering/removing/retopicing is breaking and
 # introduces a V2 event type. Indexers must tolerate unknown trailing fields.
+# The `schemaVersion` / `abiVersion` markers below MUST be bumped together with
+# docs/ABI.md; only additive trailing fields are permitted within a major
+# version. See docs/indexing_guide.md for event reconstruction rules and
+# docs/ABI.md for the frozen topic/payload layouts.
+#
+# Fault recovery: see docs/soroban-rpc-read-skew.md. Indexers must treat
+# `Stream.archived == true` as "existed on-chain, persistent entry expired or
+# not yet restored" — distinct from a stream that never existed (`stream` is
+# null). `streamExists`/`streamCount` follow the same rule: they report
+# archived entries as existing. Event ingestion is idempotent keyed on
+# (txHash, eventIndex); replaying a batch after a timeout is safe.
+
+# Schema/ABI version markers. Bump both together; additive trailing fields only.
+schemaVersion: String! @indexerMarker(value: "1.0.0")
+abiVersion: String! @indexerMarker(value: "1.0.0")
 
 scalar BigInt      # Soroban i128 / u64 amounts; XDR encodes these as ScVal
 scalar Address     # Stellar G… / C… account or contract address string
 scalar LedgerSeq   # ledger sequence number where an event appeared
+scalar TxHash      # 32-byte hex transaction hash; idempotency key with eventIndex
+scalar EventIndex  # index of the event within its transaction; idempotency key with txHash
 
 enum StreamStatus {
   Active
@@ -20,7 +46,13 @@ enum StreamStatus {
 }
 
 # Current mirror of one on-chain Stream entry. Built from StreamCreated and
-# replayed forward from every subsequent event.
+# replayed forward from every subsequent event. Field order matches the
+# StreamCreated payload order in docs/ABI.md.
+#
+# `archived` distinguishes an expired/not-yet-restored persistent entry from a
+# stream that never existed. When `archived` is true the remaining fields hold
+# the last known good snapshot; callers must not treat them as live. See
+# docs/soroban-rpc-read-skew.md for restoration and retry guidance.
 type Stream {
   streamId:         BigInt!
   sender:           Address!
@@ -40,8 +72,20 @@ type Stream {
   createdAtLedger:  LedgerSeq!
   updatedAtLedger:  LedgerSeq!
   ttlExtendedAt:    LedgerSeq!      # last TtlExtended seen
+  archived:         Boolean!        # true when the persistent entry is expired/unrestored
 }
 
+# ArchivedStream is an explicit alias for a Stream whose persistent entry has
+# expired. It carries the same fields so indexers can branch on the type.
+type ArchivedStream {
+  stream:           Stream!
+  archivedAtLedger: LedgerSeq!
+  restoredAtLedger: LedgerSeq     # null until a restore/read succeeds
+}
+
+# Event payload field order below is byte-identical to contracts/stream/src/events.rs
+# and docs/ABI.md. topic[0] is the snake_case struct name; stream_id is topic[1].
+# Do not reorder, remove, or retopic fields — that is a breaking V2 change.
 type StreamCreatedEvent { streamId: BigInt!, sender: Address!, recipient: Address!, token: Address!, deposited: BigInt!, startTime: BigInt!, endTime: BigInt!, cliffTime: BigInt!, cancellable: Boolean!, pausable: Boolean!, transferable: Boolean!, ledger: LedgerSeq! }
 type WithdrawnEvent   { streamId: BigInt!, recipient: Address!, amount: BigInt!, withdrawn: BigInt!, deposited: BigInt!, status: StreamStatus!, ledger: LedgerSeq! }
 type CancelledEvent   { streamId: BigInt!, sender: Address!, recipient: Address!, refunded: BigInt!, vested: BigInt!, withdrawn: BigInt!, endTime: BigInt!, ledger: LedgerSeq! }
@@ -53,17 +97,26 @@ type DelegateGrantedEvent { streamId: BigInt!, grantor: Address!, delegate: Addr
 type DelegateRevokedEvent { streamId: BigInt!, grantor: Address!, delegate: Address!, ledger: LedgerSeq! }
 type TtlExtendedEvent { streamId: BigInt!, extendedToLedgers: BigInt!, ledger: LedgerSeq! }
 
+# Bounded pagination: `first` defaults to 100 and is capped at 1000 so batch
+# payroll indexing cannot request unbounded result sets. See docs/gas.md.
 type Query {
   stream(id: BigInt!): Stream
-  streamsBySender(sender: Address!, first: Int, after: String): StreamConnection!
-  streamsByRecipient(recipient: Address!, first: Int, after: String): StreamConnection!
-  streamsByStatus(status: StreamStatus!, first: Int, after: String): StreamConnection!
-  events(streamId: BigInt!, fromLedger: LedgerSeq, first: Int): [Event!]!
+  streamExists(id: BigInt!): Boolean!   # true for archived entries too
+  streamCount: Int!                     # counts archived entries as existing
+  archivedStream(id: BigInt!): ArchivedStream
+  streamsBySender(sender: Address!, first: Int = 100, after: String): StreamConnection!
+  streamsByRecipient(recipient: Address!, first: Int = 100, after: String): StreamConnection!
+  streamsByStatus(status: StreamStatus!, first: Int = 100, after: String): StreamConnection!
+  events(streamId: BigInt!, fromLedger: LedgerSeq, first: Int = 100): [Event!]!
   eventsByEventType(
     eventTypes: [EventType!]!
     fromLedger: LedgerSeq
-    first: Int
+    first: Int = 100
   ): [Event!]!
+  # Idempotent retry lookup: (txHash, eventIndex) uniquely identifies an event,
+  # so replaying a batch after a timeout cannot double-apply. See
+  # docs/indexing_guide.md and docs/soroban-rpc-read-skew.md.
+  eventByKey(txHash: TxHash!, eventIndex: EventIndex!): Event
 }
 
 type StreamConnection {
@@ -100,6 +153,7 @@ enum EventType {
 
 # Realtime notifications for keepers. A keeper subscribes to ttl_extended to
 # confirm its batch sweep landed, and to stream_created to grow its id set.
+# Subscriptions are idempotent by (txHash, eventIndex); see docs/indexing_guide.md.
 type Subscription {
   streamUpdated(streamId: BigInt): Stream!
   newEvent(eventType: EventType): Event!

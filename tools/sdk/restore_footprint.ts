@@ -27,6 +27,115 @@ export interface RestoreFootprintResult {
   transaction: Transaction;
 }
 
+/**
+ * Archival detection for off-chain indexers.
+ *
+ * Soroban persistent entries (e.g. `DataKey::Stream(streamId)`) are evicted
+ * from the live ledger once their TTL lapses. The contract's `stream_exists(id)`
+ * read then returns `false` even though the stream was never closed, while the
+ * monotonically increasing `stream_count()` still reports the id as allocated.
+ *
+ * The canonical detection rule is therefore:
+ *
+ *     stream_exists(id) == false && id < stream_count()
+ *
+ * Any id satisfying that predicate is *archived*, not absent, and must be
+ * restored via a RestoreFootprint transaction before it can be read again.
+ *
+ * See `docs/soroban-rpc-read-skew.md` for the RPC read-skew caveats that make
+ * this check necessary (a lagging RPC node may still report the entry as live)
+ * and `docs/KNOWN-LIMITATIONS.md` §1 for the archival/restoration limitations.
+ */
+export function detectArchivedStream(
+  streamExists: boolean,
+  streamCount: bigint | number | string,
+  streamId: bigint | number | string,
+): boolean {
+  const id = BigInt(streamId);
+  const count = BigInt(streamCount);
+  return streamExists === false && id < count;
+}
+
+export interface RestoreAndRetryParams extends RestoreFootprintParams {
+  /** Maximum number of restore attempts before giving up. Defaults to 3. */
+  maxAttempts?: number;
+  /** Base backoff in milliseconds between attempts. Defaults to 1000. */
+  backoffMs?: number;
+  /** Optional sleep hook, injectable for tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface RestoreAndRetryResult<T> {
+  value: T;
+  /** Number of restore attempts that were required (0 = no restore needed). */
+  attempts: number;
+  /** True when a RestoreFootprint transaction was submitted. */
+  restored: boolean;
+  /** XDR of the last submitted RestoreFootprint transaction, if any. */
+  restoreXdr?: string;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Idempotent recovery wrapper for archived stream reads.
+ *
+ * Workflow (see `docs/soroban-rpc-read-skew.md` and
+ * `docs/KNOWN-LIMITATIONS.md` §1):
+ *
+ *   1. Run `read()` against the current ledger state.
+ *   2. If the entry is archived (per `detectArchivedStream`), build and submit
+ *      the RestoreFootprint transaction for the stream's persistent ledger key.
+ *   3. Re-run `read()` — restoration is idempotent, so a duplicate submission
+ *      (e.g. after a timeout where the transaction actually landed) is safe.
+ *   4. Retry with backoff up to `maxAttempts` to absorb RPC read skew, where a
+ *      node may still serve a stale view of the ledger immediately after the
+ *      restore is applied.
+ *
+ * `read` must be a pure, side-effect-free read of the stream state so that
+ * re-running it after restoration cannot corrupt indexer state.
+ */
+export async function restoreAndRetry<T>(
+  params: RestoreAndRetryParams,
+  read: () => Promise<{ streamExists: boolean; streamCount: bigint | number | string; value: T }>,
+): Promise<RestoreAndRetryResult<T>> {
+  const maxAttempts = params.maxAttempts ?? 3;
+  const backoffMs = params.backoffMs ?? 1000;
+  const sleep = params.sleep ?? defaultSleep;
+
+  let attempts = 0;
+  let restored = false;
+  let restoreXdr: string | undefined;
+
+  for (let attempt = 0; attempt <= maxAttempts; attempt += 1) {
+    const snapshot = await read();
+
+    if (!detectArchivedStream(snapshot.streamExists, snapshot.streamCount, params.streamId)) {
+      return { value: snapshot.value, attempts, restored, restoreXdr };
+    }
+
+    if (attempt === maxAttempts) {
+      break;
+    }
+
+    const result = await buildSignedRestoreFootprint(params);
+    restoreXdr = result.xdr;
+    restored = true;
+    attempts += 1;
+
+    // Restoration is idempotent: re-submitting after a timeout is safe, and
+    // the subsequent read absorbs any residual RPC read skew.
+    await sleep(backoffMs * attempts);
+  }
+
+  throw new Error(
+    `stream ${params.streamId.toString()} remained archived after ${maxAttempts} restore attempts; ` +
+      "see docs/soroban-rpc-read-skew.md and docs/KNOWN-LIMITATIONS.md §1",
+  );
+}
+
 export function buildRestoreFootprintTransaction(
   account: Account,
   key: xdr.LedgerKey,

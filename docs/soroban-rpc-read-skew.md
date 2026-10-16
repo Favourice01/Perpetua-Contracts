@@ -393,7 +393,125 @@ A single node you control cannot skew against itself. For an indexer or a keeper
 this is worth the operational cost; the barrier pattern above is a mitigation,
 not a guarantee.
 
+## Indexer recovery: skew, partial batches, and archived entries
+
+The off-chain indexer (`schema/schema.graphql`, `schema/schema.sql`) consumes
+Soroban RPC events and ledger entries. It faces three failure modes that the
+client-side barrier above does not cover on its own: read skew across a batch,
+partial batch failure mid-ingest, and reads against **archived** persistent
+entries. This section documents how the schema and the recovery primitives
+handle each.
+
+### Idempotent retry semantics keyed on `(tx_hash, event_index)`
+
+Every event row in the schema is uniquely identified by the pair
+`(tx_hash, event_index)`. That pair is the idempotency key for the whole
+ingest pipeline:
+
+- `Event` (and its derived `StreamEvent` / `VestingEvent` rows) carries a
+  `UNIQUE (tx_hash, event_index)` constraint in `schema/schema.sql` and a
+  `@derivedFrom` / `@unique` directive pair in `schema/schema.graphql`.
+- Inserts use `INSERT ... ON CONFLICT (tx_hash, event_index) DO NOTHING`
+  (SQL) and upsert-by-id (subgraph), so replaying a batch that was already
+  partially applied is a no-op for the rows that landed and a fresh insert
+  for the rows that did not.
+- Derived aggregates (`Stream.total_vested`, `Stream.total_withdrawn`,
+  `Vesting.claimed`) are recomputed from the event log rather than
+  incremented in place, so a replayed event cannot double-count.
+
+This means a stalled or partially-failed batch can be **re-run from its
+starting ledger** without truncating tables or reconciling by hand. The
+indexer records the last fully-committed ledger in `IndexerCursor`; a re-run
+starts at `IndexerCursor.last_ledger` and relies on the idempotency key to
+absorb the overlap.
+
+### RPC read skew inside a batch
+
+A batch that spans a ledger boundary can read `latestLedger = N` for the
+cursor update but `latestLedger = N-1` for a `getLedgerEntries` call in the
+same batch. The schema handles this deterministically:
+
+1. Each batch records the `latestLedger` returned by the **first** RPC call
+   as `IndexerCursor.batch_ledger`.
+2. Every subsequent read in the batch is accepted only if its
+   `latestLedger >= batch_ledger`. A read that reports a lower ledger is
+   discarded and retried; it is never merged into the batch.
+3. `IndexerCursor.last_ledger` is only advanced to `batch_ledger` after the
+   entire batch commits. A partially-applied batch leaves the cursor
+   unchanged, so the next run re-reads the same range.
+
+This is the indexer-side equivalent of the client barrier in the previous
+section: pin the batch to one ledger, and refuse to advance the cursor past a
+ledger whose events are not all present.
+
+### Archival detection and footprint restoration
+
+Persistent Soroban entries (stream records, vesting schedules) can be
+**archived** once their TTL lapses. An archived entry is not deleted — it is
+absent from the live ledger and must be restored before it can be read. The
+indexer detects this by treating a missing entry as `ARCHIVED`, not as
+`NOT_FOUND`:
+
+- A `getLedgerEntries` response that omits a key the indexer expects is
+  recorded as an `ArchivedEntry` row keyed on the same
+  `(contract_id, ledger_key)` pair used by the live tables.
+- The indexer does **not** delete or null out the corresponding `Stream` /
+  `Vesting` row. The last known state is retained and flagged
+  `archived = true`, so downstream consumers see a stale-but-valid record
+  rather than a hole.
+- Restoration is performed out-of-band by the recovery primitives below, and
+  the indexer re-reads the restored entry on the next batch.
+
+The two recovery primitives are:
+
+- **`tools/sdk/restore_footprint.ts`** — builds and submits a
+  `RestoreFootprint` operation for the archived ledger keys. It is idempotent:
+  restoring an already-live key is a no-op, so it is safe to run repeatedly
+  against a partially-restored footprint.
+- **`script/archival-canary.sh`** — a scheduled probe that reads a known set
+  of persistent keys and reports any that have gone missing. It is the
+  detection half of the loop; `restore_footprint.ts` is the repair half.
+
+The intended loop is: canary detects an archived key → operator (or the
+canary's `--auto-restore` mode) runs `restore_footprint.ts` for that key →
+indexer re-reads on the next batch and clears the `archived` flag.
+
+### Operator runbook: re-running a stalled or partially-failed batch
+
+Use this when `IndexerCursor.last_ledger` has stopped advancing, when the
+canary reports archived keys, or when a batch failed partway through.
+
+1. **Confirm the stall.** Check `IndexerCursor.last_ledger` against the
+   current `getLatestLedger()`. A gap that is not shrinking across two or
+   three poll intervals means the batch is stalled, not just slow.
+2. **Check for archived entries.** Run `script/archival-canary.sh`. If it
+   reports missing keys, run `tools/sdk/restore_footprint.ts` for those keys
+   and wait for the restore transaction to reach `SUCCESS` before continuing.
+   Do **not** re-run the batch against an unrestored footprint — the indexer
+   will keep flagging the same keys as archived.
+3. **Re-run the batch from the cursor.** Restart the indexer with
+   `--from-ledger $(IndexerCursor.last_ledger)`. Because ingest is keyed on
+   `(tx_hash, event_index)`, the overlap with the previously-applied portion
+   of the batch is absorbed as a no-op. Do not truncate tables first; that
+   discards the idempotency guarantee and can double-count derived
+   aggregates.
+4. **Verify the cursor advanced.** After the re-run, confirm
+   `IndexerCursor.last_ledger` is at or beyond the ledger you expected and
+   that no new `ArchivedEntry` rows were written for the range you just
+   processed.
+5. **If the cursor still does not advance,** the batch is failing for a
+   reason other than skew or archival — check the RPC endpoint's health and
+   the indexer logs for decode errors before retrying again. Repeated
+   re-runs are safe, but they will not fix a malformed event.
+
+The key property to rely on: **re-running a batch is always safe.** The
+idempotency key makes replay a no-op for already-applied events, the cursor
+only advances on full commit, and archived entries are flagged rather than
+dropped. There is no scenario in this pipeline where the correct operator
+action is to delete rows and start over.
+
 ## What this is not
+=======
 
 **Not a consensus or data-integrity problem.** Any node serving an older ledger
 is serving a valid, internally consistent view of a real ledger. Ledger *N* is
