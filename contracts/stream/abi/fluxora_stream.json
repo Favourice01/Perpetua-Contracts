@@ -10,6 +10,15 @@
       "outputs": "Result<u32, Error>"
     },
     {
+      "name": "batch_transfer_recipient",
+      "auth": "sender",
+      "inputs": [
+        {"name": "stream_ids", "type": "Vec<u64>"},
+        {"name": "new_recipient", "type": "Address"}
+      ],
+      "outputs": "Result<u32, Error>"
+    },
+    {
       "name": "batch_withdraw",
       "auth": "recipient",
       "inputs": [
@@ -288,7 +297,10 @@
     {"name": "DelegateExpired", "discriminant": 28},
     {"name": "MalformedStreamId", "discriminant": 29},
     {"name": "RepeatedTransfer", "discriminant": 30},
-    {"name": "InvalidTopUp", "discriminant": 31}
+    {"name": "InvalidTopUp", "discriminant": 31},
+    {"name": "DepositTooSmall", "discriminant": 32},
+    {"name": "StreamIdOverflow", "discriminant": 33},
+    {"name": "BatchSizeExceeded", "discriminant": 34}
   ],
   "events": [
     {
@@ -303,6 +315,28 @@
         {"name": "vested", "type": "i128"},
         {"name": "withdrawn", "type": "i128"},
         {"name": "end_time", "type": "u64"}
+      ]
+    },
+    {
+      "name": "DelegateGranted",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "grantor", "type": "Address"},
+        {"name": "delegate", "type": "Address"}
+      ],
+      "data": [
+        {"name": "ops", "type": "u32"},
+        {"name": "expires_at", "type": "Option<u64>"}
+      ]
+    },
+    {
+      "name": "DelegateRevoked",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "grantor", "type": "Address"},
+        {"name": "delegate", "type": "Address"}
+      ],
+      "data": [
       ]
     },
     {

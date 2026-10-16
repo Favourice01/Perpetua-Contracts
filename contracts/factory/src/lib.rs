@@ -29,7 +29,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    Env, String,
+    Bytes, BytesN, Env, IntoVal, String, Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -182,8 +182,10 @@ pub struct AdminTransferred {
 pub fn derive_stream_salt(env: &Env, sender: &Address, nonce: u64, stream_id: u64) -> BytesN<32> {
     let mut preimage = Bytes::from_slice(env, b"perpetua-factory-stream-salt-v1");
     preimage.append(&sender.to_xdr(env));
-    preimage.append(&Bytes::from_slice(env, &nonce.to_be_bytes()));
-    preimage.append(&Bytes::from_slice(env, &stream_id.to_be_bytes()));
+    let mut suffix = [0u8; 16];
+    suffix[..8].copy_from_slice(&nonce.to_be_bytes());
+    suffix[8..].copy_from_slice(&stream_id.to_be_bytes());
+    preimage.append(&Bytes::from_slice(env, &suffix));
     env.crypto().sha256(&preimage)
 }
 
@@ -474,7 +476,7 @@ impl FluxoraFactory {
         // leave a stale PendingAdmin behind; clear it so accept_admin cannot
         // later resurrect a superseded proposal.
         env.storage().instance().remove(&DataKey::PendingAdmin);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -500,7 +502,7 @@ impl FluxoraFactory {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
-        bump_instance(&env);
+        bump_ttl(&env);
 
         // CEI: the pending nomination is persisted before the event is emitted.
         AdminTransferProposed {
@@ -534,7 +536,7 @@ impl FluxoraFactory {
         config.admin = pending;
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().remove(&DataKey::PendingAdmin);
-        bump_instance(&env);
+        bump_ttl(&env);
 
         // CEI: the transfer is persisted before the event is emitted.
         AdminTransferred {
@@ -606,7 +608,7 @@ impl FluxoraFactory {
         }
         config.max_duration = max_duration;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -684,7 +686,7 @@ impl FluxoraFactory {
         let mut config = Self::guard(&env)?;
         config.max_active_streams = max_active_streams;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -733,7 +735,6 @@ impl FluxoraFactory {
 
         config.active_streams += 1;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
         Ok(stream_id)
     }
 
@@ -750,7 +751,7 @@ impl FluxoraFactory {
         }
         config.active_streams -= 1;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -767,7 +768,7 @@ impl FluxoraFactory {
         config.max_creations_per_window = max_creations_per_window;
         config.rate_limit_window_ledgers = rate_limit_window_ledgers;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 }

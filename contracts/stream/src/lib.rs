@@ -87,25 +87,17 @@ use soroban_sdk::{
 /// full batch against protocol 27's mainnet limits, and the constraint that
 /// binds is not the one you would expect:
 ///
-/// Measured evidence from the release resource suite (20-stream batch):
+/// The release resource suite measures a full batch at this cap and asserts
+/// 2x headroom for footprint, writes, memory reads, and event bytes, while
+/// staying below the instruction ceiling. Each successful withdrawal also
+/// emits the token contract's own transfer event, so the event cost depends on
+/// the token implementation; the tests use the Stellar Asset Contract and
+/// record `mem_bytes` and per-item scaling for review.
 ///
-/// | limit | used by a 20-stream batch | ceiling |
-/// |---|---|---|
-/// | total footprint (entries) | 51 | 400 |
-/// | write entries | 24 | 200 |
-/// | instructions | ~5.8M | 400M |
-/// | **contract event bytes** | **10,240** | **16,384** |
-///
-/// Entry counts would allow well over a hundred streams per call. The *event
-/// budget* allows about 32, because each stream emits a `withdrawn` event plus
-/// the token contract's own `transfer` event — roughly 512 bytes per stream
-/// between them.
-///
-/// Sixteen is that measured ceiling with a 2x safety factor. The margin is not
-/// decoration: the per-stream event cost depends on the *token's* event
-/// payload, and a token heavier than the Stellar Asset Contract used in the
-/// tests would inflate it. A cap that merely fits today would fail on somebody
-/// else's token.
+/// The cap is intentionally conservative: event bytes, rather than ledger
+/// entries or instructions, are the tightest measured resource. A heavier
+/// token can emit larger transfer events, so a cap that only fits the test
+/// token would be unsafe for general use.
 ///
 /// Larger requests are rejected with [`Error::BatchTooLarge`] rather than
 /// failing opaquely at the network level. The SDK chunks client-side, so the
@@ -500,6 +492,7 @@ impl FluxoraStream {
         };
 
         Self::apply_withdrawal(&env, stream_id, &mut stream, payout)?;
+        Self::bump_instance_ttl(&env);
         Ok(payout)
     }
 
@@ -569,6 +562,10 @@ impl FluxoraStream {
             } else {
                 Self::apply_withdrawal(&env, stream_id, &mut stream, payout)?;
             }
+        }
+
+        if total > 0 {
+            Self::bump_instance_ttl(&env);
         }
 
         Ok(total)
@@ -1005,6 +1002,7 @@ impl FluxoraStream {
         };
 
         Self::apply_withdrawal(&env, stream_id, &mut stream, payout)?;
+        Self::bump_instance_ttl(&env);
         Ok(payout)
     }
 
@@ -1495,8 +1493,6 @@ impl FluxoraStream {
         let token = stream.token.clone();
         let recipient = stream.recipient.clone();
         storage::save_stream(env, stream_id, stream);
-        Self::bump_instance_ttl(env);
-
         token_transfer(
             env,
             &token,
