@@ -1378,7 +1378,7 @@ impl FluxoraGovernance {
 
         let threshold = get_threshold(&env)?;
         let now = env.ledger().timestamp();
-        let quorum_reached = if approval_count == threshold {
+        let quorum_reached = if accumulated >= threshold as u64 {
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
             proposal.eta = executable_after;
             proposal.status = ProposalStatus::Queued;
@@ -3416,6 +3416,28 @@ mod tests {
         ctx.client.execute(&executor, &id);
         let p = ctx.client.get_proposal(&id);
         assert!(p.executed);
+    }
+
+    #[test]
+    fn test_weighted_vote_reaches_quorum_before_approval_count_threshold() {
+        let ctx = Ctx::setup();
+        ctx.client.set_vote_weight(&ctx.signer_a, &2);
+
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("weighted"));
+        ctx.client.approve(&ctx.signer_a, &id);
+
+        let proposal = ctx.client.get_proposal(&id);
+        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.approval_weight, 2);
+        assert_eq!(proposal.status, ProposalStatus::Queued);
+        assert_eq!(ctx.client.get_quorum_info(&id).unwrap().threshold, 2);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        ctx.client.execute(&executor, &id);
+        assert!(ctx.client.get_proposal(&id).executed);
     }
 
     #[test]

@@ -46,24 +46,24 @@ helper functions and counting the leaf storage operations.
 
 | entrypoint | reads | writes | total ops |
 |---|---:|---:|---:|
-| `propose` | 1 | 5 | 6 |
-| `approve` | 5 | 10 | 15 |
-| `execute` | 6 | 8 | 14 |
+| `propose` | 3 | 6 | 9 |
+| `approve` | 5 | 8 | 13 |
+| `execute` | 6 | 7 | 13 |
 
 Breakdown:
 
 | entrypoint | operations |
 |---|---|
-| `propose` | `instance_write` 1, `instance_bump` 1, `persistent_write` 1, `persistent_bump` 1, `ledger_read` 1, `event_emit` 1 |
-| `approve` | `persistent_read` 1, `persistent_write` 3, `persistent_bump` 4, `persistent_exists` 2, `instance_read` 1, `instance_bump` 1, `ledger_read` 2, `event_emit` 2 |
-| `execute` | `persistent_read` 1, `persistent_write` 1, `persistent_bump` 3, `persistent_exists` 2, `instance_read` 1, `instance_write` 2, `instance_bump` 1, `ledger_read` 3, `event_emit` 1 |
+| `propose` | `instance_write` 1, `instance_bump` 1, `persistent_write` 1, `persistent_bump` 2, `persistent_exists` 2, `ledger_read` 1, `event_emit` 1 |
+| `approve` | `persistent_read` 1, `persistent_write` 3, `persistent_bump` 2, `persistent_exists` 2, `instance_read` 1, `instance_bump` 1, `ledger_read` 2, `event_emit` 2 |
+| `execute` | `persistent_read` 1, `persistent_write` 1, `persistent_bump` 2, `persistent_exists` 2, `instance_read` 1, `instance_write` 2, `instance_bump` 1, `ledger_read` 3, `event_emit` 1 |
 
 Two notes on reading this table:
 
 * **`approve` reports `event_emit` 2, but a steady-state vote emits one.** The
-  model cannot evaluate `if approval_count == threshold`, so it counts both
-  `vote_cast` and `proposal_queued`. Only the vote that reaches threshold pays
-  for the second. This is checked structurally — see §3.
+   model cannot evaluate `if accumulated_weight >= threshold`, so it counts both
+   `vote_cast` and `proposal_queued`. Only the vote that reaches weighted quorum
+   pays for the second. This is checked structurally — see §3.
 * **`execute` is a floor, not the whole transaction.** The dispatched target
   contract's own work is metered separately and is not modelled here.
 
@@ -72,14 +72,14 @@ Two notes on reading this table:
 The scenario issue #54 names: 10 signers, threshold 10.
 
 ```text
-propose                 6 ops
-10 x approve          150 ops   (15 each)
-execute                14 ops
+propose                 9 ops
+10 x approve          130 ops   (13 each)
+execute                13 ops
                      -------
-total                170 ops
+total                152 ops
 ```
 
-Every vote costs the same 15 operations. There is no per-signer
+Every vote costs the same 13 operations. There is no per-signer
 multiplication inside a vote, which is the property that matters — see §3.
 
 ## 3. Why per-vote cost does not grow with the signer count
@@ -110,7 +110,7 @@ unconditional, all 10 votes would pay for one. The check locates the
 backwards to the enclosing block, and fails if either is no longer inside an
 `if`.
 
-**Consequence:** a vote is 15 operations whether the contract has 3 signers or
+**Consequence:** a vote is 13 operations whether the contract has 3 signers or
 20. `MAX_SIGNERS = 20` is enforced separately in `init` and `add_signer`.
 
 ## 4. Event bytes for a voting round
