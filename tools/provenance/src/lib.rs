@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -96,6 +96,9 @@ pub enum Error {
     MissingArtifact {
         name: String,
     },
+    DuplicateArtifact {
+        name: String,
+    },
     HashMismatch {
         name: String,
         expected: String,
@@ -143,6 +146,9 @@ impl fmt::Display for Error {
                 f,
                 "artifact listed in the manifest is missing from the release dir: {name}"
             ),
+            Error::DuplicateArtifact { name } => {
+                write!(f, "artifact is listed more than once in the manifest: {name}")
+            }
             Error::HashMismatch {
                 name,
                 expected,
@@ -546,8 +552,12 @@ pub fn verify(
     let manifest: Manifest = serde_json::from_str(&text).map_err(Error::Json)?;
 
     // Integrity — every recorded artifact must exist with the recorded hash.
+    let files = list_wasm_files(release_dir)?;
+    if files.is_empty() {
+        return Err(Error::NoWasmArtifacts(release_dir.to_path_buf()));
+    }
     let mut current = BTreeMap::new();
-    for path in list_wasm_files(release_dir)? {
+    for path in files {
         let name = path
             .file_name()
             .unwrap_or_default()
@@ -555,7 +565,13 @@ pub fn verify(
             .into_owned();
         current.insert(name, hash_file(&path)?);
     }
+    let mut seen = BTreeSet::new();
     for subject in &manifest.subject {
+        if !seen.insert(subject.name.as_str()) {
+            return Err(Error::DuplicateArtifact {
+                name: subject.name.clone(),
+            });
+        }
         let Some(actual) = current.get(&subject.name) else {
             return Err(Error::MissingArtifact {
                 name: subject.name.clone(),
@@ -585,6 +601,8 @@ pub fn verify(
     };
     let meta = collect_metadata(&root)?;
 
+    check_field("schema", &manifest.schema, &SCHEMA.to_string())?;
+    check_field("build_type", &manifest.build.build_type, &BUILD_TYPE.to_string())?;
     check_field("target", &manifest.build.target, &target.to_string())?;
     check_field(
         "git_revision",
@@ -739,6 +757,30 @@ targets = ["wasm32v1-none"]
 
     fn write_wasm(release: &Path, name: &str, content: &[u8]) {
         fs::write(release.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn sha256_hex_matches_the_standard_empty_input_vector() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn list_wasm_files_sorts_files_and_ignores_directories_and_other_files() {
+        let s = scratch_repo();
+        write_wasm(&s.release, "z.wasm", b"z");
+        write_wasm(&s.release, "a.wasm", b"a");
+        fs::write(s.release.join("notes.txt"), "ignored").unwrap();
+        fs::create_dir(s.release.join("directory.wasm")).unwrap();
+
+        let names: Vec<String> = list_wasm_files(&s.release)
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.wasm", "z.wasm"]);
     }
 
     fn sample_wasm() -> Vec<u8> {
@@ -927,6 +969,64 @@ targets = ["wasm32v1-none"]
         match verify(&s.release, None, None, DEFAULT_TARGET) {
             Err(Error::UnlistedArtifact { name }) => assert_eq!(name, "fluxora_sneaky.wasm"),
             other => panic!("expected UnlistedArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_rejects_an_empty_release_dir() {
+        let s = scratch_repo();
+        write_wasm(&s.release, "fluxora_stream.wasm", &sample_wasm());
+        generate(&s.release, None, None, DEFAULT_TARGET).unwrap();
+        fs::remove_file(s.release.join("fluxora_stream.wasm")).unwrap();
+
+        assert!(matches!(
+            verify(&s.release, None, None, DEFAULT_TARGET),
+            Err(Error::NoWasmArtifacts(path)) if path == s.release
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_duplicate_manifest_subjects() {
+        let s = scratch_repo();
+        write_wasm(&s.release, "fluxora_stream.wasm", &sample_wasm());
+        let mut manifest = generate(&s.release, None, None, DEFAULT_TARGET).unwrap();
+        manifest.subject.push(manifest.subject[0].clone());
+        fs::write(
+            s.release.join(MANIFEST_FILENAME),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            verify(&s.release, None, None, DEFAULT_TARGET),
+            Err(Error::DuplicateArtifact { name }) if name == "fluxora_stream.wasm"
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_drifted_manifest_identifiers() {
+        for (field, recorded) in [
+            ("schema", "https://example.invalid/provenance"),
+            ("build_type", "https://example.invalid/build"),
+        ] {
+            let s = scratch_repo();
+            write_wasm(&s.release, "fluxora_stream.wasm", &sample_wasm());
+            let mut manifest = generate(&s.release, None, None, DEFAULT_TARGET).unwrap();
+            if field == "schema" {
+                manifest.schema = recorded.to_string();
+            } else {
+                manifest.build.build_type = recorded.to_string();
+            }
+            fs::write(
+                s.release.join(MANIFEST_FILENAME),
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                verify(&s.release, None, None, DEFAULT_TARGET),
+                Err(Error::MetadataMismatch { field: actual, .. }) if actual == field
+            ));
         }
     }
 
