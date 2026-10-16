@@ -148,7 +148,9 @@ holds:
 2. **Completeness** — a `*.wasm` in the release dir is not listed in the
    manifest. "Provenance for every contract" is enforced both directions, so a
    newly added contract can never slip out unprovenanced.
-3. **Environment consistency** — the recorded `target`, `git_revision`,
+3. **Format and environment consistency** — the recorded `schema` and
+  `build_type` must match this verifier's supported manifest format. The
+  recorded `target`, `git_revision`,
    `rustc`, `cargo`, `soroban_sdk`, `toolchain_channel` or `profile` no longer
    match the current checkout and toolchain. This catches a manifest that was
    generated from a different commit or with different build inputs than the
@@ -179,8 +181,8 @@ Explicit contract, so the gate is predictable:
 - **Failure** — every failure mode is a typed error with a specific message
   and a non-zero exit: missing release dir, dir is not a directory, no `*.wasm`
   found, workspace root not found, unparseable manifest, missing/unlisted
-  artifact, hash mismatch (both hashes reported), metadata drift (field and
-  both values reported), git/toolchain invocation failure. `verify` never
+  artifact, hash mismatch (both hashes reported), schema/build-type or other
+  metadata drift (field and both values reported), git/toolchain invocation failure. `verify` never
   writes anything.
 - **Boundaries** — an empty release dir is an error (`no *.wasm artifacts`),
   not a silently-empty manifest; a release gate that covers nothing is worse

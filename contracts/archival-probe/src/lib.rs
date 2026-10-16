@@ -77,12 +77,15 @@ pub struct ArchivalProbe;
 
 #[contractimpl]
 impl ArchivalProbe {
-    /// Write the canary. **Deliberately does not extend the entry's TTL**, so
-    /// it receives exactly the network's `min_persistent_ttl` and begins the
-    /// shortest possible countdown to archival.
+    /// Plant the canary once. Retries are first-write-wins, so an ambiguous
+    /// transaction result cannot reset the archival countdown or replace the
+    /// original note. The entry deliberately receives no TTL extension.
     ///
     /// Permissionless: there is nothing here worth protecting.
     pub fn plant(env: Env, note: Symbol) {
+        if env.storage().persistent().has(&Key::Canary) {
+            return;
+        }
         env.storage().persistent().set(&Key::Canary, &note);
         // No extend_ttl call. That omission is the entire point of this
         // contract; do not "fix" it.
@@ -126,6 +129,29 @@ mod test {
         client.plant(&symbol_short!("canary"));
         assert!(client.planted());
         assert_eq!(client.read(), symbol_short!("canary"));
+    }
+
+    #[test]
+    fn retry_does_not_replace_note_or_refresh_ttl() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        use soroban_sdk::testutils::Ledger as _;
+
+        let env = Env::default();
+        let id = env.register(ArchivalProbe, ());
+        let client = ArchivalProbeClient::new(&env, &id);
+
+        client.plant(&symbol_short!("first"));
+        let planted_at = env.ledger().sequence();
+        env.ledger().set_sequence_number(planted_at + 100);
+        let ttl_before_retry =
+            env.as_contract(&id, || env.storage().persistent().get_ttl(&Key::Canary));
+
+        client.plant(&symbol_short!("retry"));
+
+        let ttl_after_retry =
+            env.as_contract(&id, || env.storage().persistent().get_ttl(&Key::Canary));
+        assert_eq!(ttl_after_retry, ttl_before_retry);
+        assert_eq!(client.read(), symbol_short!("first"));
     }
 
     /// The probe must never extend its own TTL — that omission is what makes it
