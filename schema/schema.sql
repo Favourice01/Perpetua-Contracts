@@ -9,6 +9,18 @@
 -- Mirrors contracts/stream/src/events.rs. Amounts are i128, times are u64
 -- (unix seconds), both stored as NUMERIC(39). Ledger sequence is u32.
 -- On chain, stream_id is u64 — keep it BIGINT here so ids never collide.
+--
+-- Invariants (kept in lockstep with schema/schema.graphql, #294):
+--   * Amounts are i128, stored as NUMERIC(39) — no silent wrapping; the
+--     full i128 range fits without truncation.
+--   * Time ordering: end_time > start_time and
+--     start_time <= cliff_time <= end_time. Degenerate parameters
+--     (zero-duration cliffs, inverted ranges) are rejected early.
+--   * Accounting: deposited >= 0, withdrawn >= 0, withdrawn <= deposited,
+--     paused_total >= 0, ttl_extended_at >= 0.
+--   * status is one of 'active' | 'paused' | 'cancelled' | 'depleted'.
+-- These CHECK constraints mirror the GraphQL projection so both stay
+-- aligned with the frozen ABI.
 
 CREATE TABLE IF NOT EXISTS events (
     id              BIGSERIAL PRIMARY KEY,
@@ -40,10 +52,20 @@ CREATE TABLE IF NOT EXISTS streams (
     transferable    BOOLEAN   NOT NULL,
     paused_at       BIGINT,
     paused_total    BIGINT    NOT NULL DEFAULT 0,
-    status          TEXT      NOT NULL,             -- Active|Paused|Cancelled|Depleted
+    status          TEXT      NOT NULL,             -- active|paused|cancelled|depleted
     created_ledger  INTEGER   NOT NULL,
     updated_ledger  INTEGER   NOT NULL,
-    ttl_extended_at INTEGER   NOT NULL DEFAULT 0
+    ttl_extended_at INTEGER   NOT NULL DEFAULT 0,
+
+    -- Boundary / invariant guards (mirrors schema/schema.graphql, #294).
+    CONSTRAINT streams_end_after_start   CHECK (end_time > start_time),
+    CONSTRAINT streams_cliff_in_range    CHECK (cliff_time BETWEEN start_time AND end_time),
+    CONSTRAINT streams_deposited_nonneg  CHECK (deposited >= 0),
+    CONSTRAINT streams_withdrawn_nonneg  CHECK (withdrawn >= 0),
+    CONSTRAINT streams_withdrawn_le_dep  CHECK (withdrawn <= deposited),
+    CONSTRAINT streams_paused_total_nonneg CHECK (paused_total >= 0),
+    CONSTRAINT streams_ttl_extended_nonneg CHECK (ttl_extended_at >= 0),
+    CONSTRAINT streams_status_valid      CHECK (status IN ('active', 'paused', 'cancelled', 'depleted'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_streams_sender    ON streams (sender);

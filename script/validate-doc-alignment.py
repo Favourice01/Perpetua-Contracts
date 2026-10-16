@@ -5,6 +5,9 @@ Checks:
    - README.md function signatures match lib.rs #[contractimpl] pub fn signatures
    - docs/ABI.md constants match source code (MAX_BATCH_SIZE, MIN_STREAM_TTL_LEDGERS)
    - error codes in error.md match ContractError enum discriminants
+   - script/keeper-extend-ttl.sh documented interface (env vars, flags, ttl_extended
+     event row) matches docs/mainnet_release_checklist.md, docs/indexing_guide.md
+     and docs/ABI.md
 
 Exit 0 if all checks pass, exit 1 on mismatch.
 """
@@ -17,6 +20,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Intentional non-ABI entries that are documented but not public entrypoints.
 AUDIT_ENTRYPOINT_ALLOWLIST = {"upgrade", "compute_keeper_fee_split"}
+
+# Documented interface of script/keeper-extend-ttl.sh that must stay in sync
+# with the markdown docs. Keep these lists in lockstep with the script's
+# `# Environment:` and `# Usage:` header blocks.
+KEEPER_ENV_VARS = ["CONTRACT_ID", "SOURCE", "IDS_FILE", "NETWORK", "RPC_URL", "BATCH_SIZE"]
+KEEPER_FLAGS = ["--once", "--json", "--dry-run", "--help"]
+KEEPER_EVENT_NAME = "ttl_extended"
+KEEPER_EVENT_TOPICS = ["stream_id"]
+KEEPER_EVENT_PAYLOAD = ["old_ttl", "new_ttl", "ledger"]
 
 
 def extract_contractimpl_pub_fns(source: str) -> list[str]:
@@ -154,6 +166,112 @@ def check_abi_constants() -> bool:
     return True  # Don't fail on warnings for now
 
 
+def parse_keeper_script_interface(source: str) -> dict[str, list[str]]:
+    """Parse the `# Environment:` and `# Usage:` header blocks of the keeper script.
+
+    Returns a dict with `env` and `flags` keys holding the documented names.
+    """
+    env_vars: list[str] = []
+    flags: list[str] = []
+    section: str | None = None
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# Environment:"):
+            section = "env"
+            continue
+        if stripped.startswith("# Usage:"):
+            section = "flags"
+            continue
+        if not stripped.startswith("#"):
+            # A non-comment line ends the header block.
+            if section is not None and stripped and not stripped.startswith("#!"):
+                section = None
+            continue
+        body = stripped.lstrip("#").strip()
+        if not body:
+            continue
+        if section == "env":
+            match = re.match(r"([A-Z][A-Z0-9_]*)\s*=", body)
+            if match:
+                env_vars.append(match.group(1))
+        elif section == "flags":
+            for flag in re.findall(r"--[a-z][a-z0-9-]*", body):
+                flags.append(flag)
+    return {"env": env_vars, "flags": flags}
+
+
+def check_keeper_doc_alignment() -> bool:
+    """Verify the keeper runner's documented interface matches the markdown docs."""
+    script = REPO_ROOT / "script" / "keeper-extend-ttl.sh"
+    checklist_md = REPO_ROOT / "docs" / "mainnet_release_checklist.md"
+    indexing_md = REPO_ROOT / "docs" / "indexing_guide.md"
+    abi_md = REPO_ROOT / "docs" / "ABI.md"
+
+    for path in (script, checklist_md, indexing_md, abi_md):
+        if not path.exists():
+            print(f"SKIP: {path} not found")
+            return True
+
+    source = script.read_text(encoding="utf-8")
+    checklist = checklist_md.read_text(encoding="utf-8")
+    indexing = indexing_md.read_text(encoding="utf-8")
+    abi = abi_md.read_text(encoding="utf-8")
+
+    parsed = parse_keeper_script_interface(source)
+    documented_env = set(parsed["env"])
+    documented_flags = set(parsed["flags"])
+
+    ok = True
+
+    # Every env var the script documents must appear in the script header and
+    # in both markdown docs.
+    for name in KEEPER_ENV_VARS:
+        if name not in documented_env:
+            print(f"FAIL: env var {name} missing from keeper-extend-ttl.sh header")
+            ok = False
+        if name not in checklist:
+            print(f"FAIL: env var {name} missing from docs/mainnet_release_checklist.md")
+            ok = False
+        if name not in indexing:
+            print(f"FAIL: env var {name} missing from docs/indexing_guide.md")
+            ok = False
+
+    # Every flag the script documents must appear in the script header and in
+    # both markdown docs.
+    for flag in KEEPER_FLAGS:
+        if flag not in documented_flags:
+            print(f"FAIL: flag {flag} missing from keeper-extend-ttl.sh header")
+            ok = False
+        if flag not in checklist:
+            print(f"FAIL: flag {flag} missing from docs/mainnet_release_checklist.md")
+            ok = False
+        if flag not in indexing:
+            print(f"FAIL: flag {flag} missing from docs/indexing_guide.md")
+            ok = False
+
+    # The ttl_extended event row in ABI.md must match the topic/payload layout
+    # the keeper consumes.
+    event_row = None
+    for line in abi.splitlines():
+        if KEEPER_EVENT_NAME in line and "|" in line:
+            event_row = line
+            break
+    if event_row is None:
+        print(f"FAIL: {KEEPER_EVENT_NAME} event row missing from docs/ABI.md")
+        ok = False
+    else:
+        for topic in KEEPER_EVENT_TOPICS:
+            if topic not in event_row:
+                print(f"FAIL: {KEEPER_EVENT_NAME} topic {topic} missing from docs/ABI.md row")
+                ok = False
+        for field in KEEPER_EVENT_PAYLOAD:
+            if field not in event_row:
+                print(f"FAIL: {KEEPER_EVENT_NAME} payload field {field} missing from docs/ABI.md row")
+                ok = False
+
+    return ok
+
+
 def check_error_alignment() -> bool:
     """Check that error.md discriminants match ContractError enum."""
     error_rs = REPO_ROOT / "contracts" / "stream" / "src" / "error.rs"
@@ -193,6 +311,10 @@ def main() -> int:
 
     print("Checking error.md discriminant alignment...")
     if not check_error_alignment():
+        passed = False
+
+    print("Checking keeper-extend-ttl.sh documentation alignment...")
+    if not check_keeper_doc_alignment():
         passed = False
 
     if passed:

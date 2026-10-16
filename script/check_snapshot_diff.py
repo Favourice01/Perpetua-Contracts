@@ -10,16 +10,28 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Default corpus of golden event snapshot fixtures (keeper runner, clone/cancel).
+DEFAULT_FIXTURES_DIR = "tests/fixtures/event_snapshots"
+
 # Security-relevant fields in snapshot JSON files
 SECURITY_FIELDS = {
     "auth", "auths", "require_auth", "signatures", "events", "topic",
     "topics", "data", "error", "error_code", "ContractError", "storage",
     "state", "DataKey",
+    # Keeper batch TTL renewal runner event/state fields (#291)
+    "ttl_extended", "extended_to_ledgers", "keeper", "keeper_fee",
+    "recipient_amount", "refunded", "stream_cloned", "deposit_amount",
 }
 
 
-def get_changed_files(base: str, head: str | None = None) -> list[str]:
-    """Return changed snapshot JSON paths between two git refs."""
+def get_changed_files(
+    base: str, head: str | None = None, fixtures_dir: str = DEFAULT_FIXTURES_DIR
+) -> list[str]:
+    """Return changed snapshot JSON paths between two git refs.
+
+    Covers both ``contracts/stream/test_snapshots/*.json`` and the golden
+    event snapshot fixtures under ``fixtures_dir``.
+    """
     args = ["git", "diff", "--name-only", base]
     if head is not None:
         args.append(head)
@@ -29,15 +41,22 @@ def get_changed_files(base: str, head: str | None = None) -> list[str]:
     except subprocess.CalledProcessError:
         return []
 
+    normalized_fixtures = fixtures_dir.rstrip("/")
     return [
         path for path in output.decode("utf-8").splitlines()
-        if path.endswith(".json") and "test_snapshots" in path
+        if path.endswith(".json")
+        and ("test_snapshots" in path or path.startswith(normalized_fixtures + "/"))
     ]
 
 
-def get_changed_snapshots(base: str) -> list[Path]:
+def get_changed_snapshots(
+    base: str, fixtures_dir: str = DEFAULT_FIXTURES_DIR
+) -> list[Path]:
     """Compatibility wrapper returning changed snapshot paths as ``Path`` objects."""
-    return [REPO_ROOT / path for path in get_changed_files(base)]
+    return [
+        REPO_ROOT / path
+        for path in get_changed_files(base, fixtures_dir=fixtures_dir)
+    ]
 
 
 def get_file_content(commit: str | None, path: str) -> str | None:
@@ -112,9 +131,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Check snapshot security diffs")
     parser.add_argument("--base", default="HEAD", help="Base ref to compare against")
     parser.add_argument("--head", default=None, help="Head ref to compare against")
+    parser.add_argument(
+        "--fixtures-dir",
+        default=DEFAULT_FIXTURES_DIR,
+        help="Directory of golden event snapshot fixtures to diff",
+    )
     args = parser.parse_args()
 
-    changed_files = get_changed_files(args.base, args.head)
+    changed_files = get_changed_files(args.base, args.head, args.fixtures_dir)
     if not changed_files:
         print("No snapshot JSON files changed.")
         raise SystemExit(0)

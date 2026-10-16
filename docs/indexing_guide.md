@@ -229,6 +229,93 @@ This Python snippet intentionally prints raw event metadata only. Decode the
 base64 XDR topics and value with a Stellar Python SDK or XDR implementation
 before interpreting stream IDs, addresses, statuses, or amounts.
 
+## Reconstructing stream state from `ttl_extended` events
+
+The Automated Keeper Batch TTL Renewal Runner
+([`script/keeper-extend-ttl.sh`](../script/keeper-extend-ttl.sh)) emits one
+`ttl_extended` event per stream it renews. These events are the only on-chain
+record of a keeper sweep, so an indexer must be able to rebuild the renewed TTL
+state from them alone.
+
+### Topic layout
+
+`ttl_extended` is the narrowest Perpetua event. It has exactly two topics and
+no routing parties:
+
+| position | value | notes |
+|---|---|---|
+| `topic[0]` | `symbol("ttl_extended")` | base64-encoded XDR `SCVal` |
+| `topic[1]` | `u64(stream_id)` | base64-encoded XDR `SCVal` |
+
+There is no `topic[2]` or `topic[3]`. A decoder that assumes four topics will
+read past the end of the vector; always branch on `topic.length` (see
+[ABI.md](ABI.md#topic-positions) for the frozen layout of every event).
+
+### Payload schema
+
+The event value is a single `i128`-free integer map with one field:
+
+```text
+{ extended_to_ledgers: u32 }
+```
+
+`extended_to_ledgers` is the number of ledgers the keeper added to the stream's
+live-until ledger in this sweep, not the absolute expiry. The absolute expiry
+is `previous_live_until_ledger + extended_to_ledgers`, so a projection that
+only stores the delta must be replayed in ledger order to stay correct.
+
+### Mapping to `ttlExtendedAt`
+
+The GraphQL schema exposes the renewal as a timestamp, not a ledger delta.
+`schema/schema.graphql` defines `ttlExtendedAt` on the stream type; populate it
+from the event's ledger close time:
+
+```text
+ttlExtendedAt = close_time(event.ledger)
+```
+
+Do not derive `ttlExtendedAt` from `extended_to_ledgers`; the delta is a ledger
+count and the field is a wall-clock timestamp. If a stream is renewed more than
+once, `ttlExtendedAt` holds the most recent renewal, so apply events in
+`(ledger, txIndex, eventIndex)` order and let the last write win.
+
+### Reconciling a keeper sweep summary
+
+`script/keeper-extend-ttl.sh` prints a sweep summary (streams attempted,
+streams renewed, ledgers added). Reconcile it against the event stream before
+trusting either source:
+
+1. Count `ttl_extended` events in the sweep's ledger range and compare with the
+   summary's renewed count. A mismatch means a page was dropped or the summary
+   was truncated.
+2. Sum `extended_to_ledgers` across those events and compare with the summary's
+   total ledgers added. A mismatch means a payload was decoded with the wrong
+   integer width.
+3. For each event, confirm `stream_exists(topic[1])` is still true. A renewed
+   stream that has since been cancelled or fully withdrawn is expected to be
+   absent; a stream that vanished without a terminal event is a gap.
+
+### Detecting archived entries
+
+A stream whose TTL lapsed is archived rather than deleted, so it disappears
+from `getLedgerEntries` while its ID remains below the current counter. Detect
+it with the pair of read-only calls:
+
+```text
+stream_exists(id) == false  &&  id < stream_count()
+```
+
+When both hold, the stream is archived and the projection should surface a
+restore action instead of dropping the row. Mark the record `archived`, keep
+the last known state, and emit a `restore` task so an operator can submit the
+restore transaction. Do not treat the missing entry as a deletion: the ID is
+still allocated and will be reused by no other stream.
+
+Reads that race a ledger close can observe a stale `stream_count()` or a
+missing entry that is about to appear. Apply the skew rules in
+[soroban-rpc-read-skew.md](soroban-rpc-read-skew.md) before concluding that a
+stream is archived.
+
 ## Operational recommendations
 
 1. Backfill from a known ledger before the contract deployment ledger, then

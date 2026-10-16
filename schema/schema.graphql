@@ -8,10 +8,49 @@
 # contract event is additive; reordering/removing/retopicing is breaking and
 # introduces a V2 event type. Indexers must tolerate unknown trailing fields.
 
-scalar BigInt      # Soroban i128 / u64 amounts; XDR encodes these as ScVal
+# Invariants
+#
+# The following invariants are enforced at ingestion time by every indexer
+# implementing this schema. Violations MUST be rejected (deterministic error,
+# no partial write, no event emission) rather than silently stored. See
+# docs/ABI.md for the canonical error variants referenced below.
+#
+# I1.  Stream.deposited >= 0 and Stream.withdrawn >= 0.
+# I2.  Stream.withdrawn <= Stream.deposited (no over-withdrawal).
+# I3.  Stream.startTime >= 0, Stream.endTime >= 0, Stream.cliffTime >= 0.
+# I4.  Stream.endTime > Stream.startTime (inverted/zero-duration ranges are
+#      rejected as `InvalidTimeRange`; a zero-duration cliff is NOT a valid
+#      substitute for a zero-duration stream).
+# I5.  Stream.startTime <= Stream.cliffTime <= Stream.endTime. A cliff equal
+#      to startTime is allowed (no cliff); a cliff outside the range is
+#      rejected as `InvalidCliffTime`.
+# I6.  Stream.pausedTotal >= 0 and Stream.pausedTotal is monotonically
+#      non-decreasing across ResumedEvent replays.
+# I7.  Stream.deposited and Stream.withdrawn are i128 values. They MUST be
+#      decoded from XDR ScVal as decimal strings and MUST NOT be routed
+#      through IEEE-754 numbers at any point (no `Number`, `f64`, `double`).
+#      Deposit rates exceeding i128::MAX are rejected as `DepositRateTooLow`
+#      or `Overflow` per docs/ABI.md; no silent wrapping is permitted.
+# I8.  StreamStatus transitions are monotonic: Active -> Paused -> Active,
+#      Active/Paused -> Cancelled, Active/Paused -> Depleted. `Cancelled` is
+#      sticky: a cancelled stream NEVER transitions to `Depleted`, even when
+#      withdrawn == deposited. `Depleted` is terminal.
+# I9.  TtlExtendedEvent.extendedToLedgers is a u32 (0 <= value <= 2^32 - 1).
+#      Out-of-range values are rejected as `Overflow`.
+# I10. Same-ledger `ttl_extended` events are idempotent: replaying multiple
+#      TtlExtendedEvent rows for one streamId at the same ledger is
+#      last-write-wins on Stream.ttlExtendedAt; no duplicate side effects.
+
+scalar BigInt      # Soroban i128 / u64 amounts; XDR encodes these as ScVal.
+                   # Decode as decimal strings only — never IEEE-754 (see I7).
 scalar Address     # Stellar G… / C… account or contract address string
 scalar LedgerSeq   # ledger sequence number where an event appeared
 
+# Transition rules (see I8):
+#   Active   -> Paused | Cancelled | Depleted
+#   Paused   -> Active | Cancelled | Depleted
+#   Cancelled -> (terminal, sticky; never Depleted)
+#   Depleted  -> (terminal)
 enum StreamStatus {
   Active
   Paused
@@ -21,25 +60,33 @@ enum StreamStatus {
 
 # Current mirror of one on-chain Stream entry. Built from StreamCreated and
 # replayed forward from every subsequent event.
+#
+# Boundary guards applied on every write (see # Invariants above):
+#   - deposited, withdrawn, startTime, endTime, cliffTime, pausedTotal are
+#     non-negative (I1, I3, I6).
+#   - withdrawn <= deposited (I2).
+#   - endTime > startTime (I4); startTime <= cliffTime <= endTime (I5).
+#   - deposited/withdrawn decoded as i128 decimal strings, never floats (I7).
+#   - status transitions follow I8; Cancelled is sticky.
 type Stream {
   streamId:         BigInt!
   sender:           Address!
   recipient:        Address!
   token:            Address!
-  deposited:        BigInt!
-  withdrawn:        BigInt!
-  startTime:        BigInt!
-  endTime:          BigInt!
-  cliffTime:        BigInt!
+  deposited:        BigInt!         # i128, decimal string, >= 0 (I1, I7)
+  withdrawn:        BigInt!         # i128, decimal string, 0 <= x <= deposited (I1, I2, I7)
+  startTime:        BigInt!         # >= 0 (I3)
+  endTime:          BigInt!         # > startTime (I3, I4)
+  cliffTime:        BigInt!         # startTime <= cliffTime <= endTime (I3, I5)
   cancellable:      Boolean!
   pausable:         Boolean!
   transferable:     Boolean!
   pausedAt:         BigInt          # null when not paused
-  pausedTotal:      BigInt!
-  status:           StreamStatus!
+  pausedTotal:      BigInt!         # >= 0, monotonic non-decreasing (I6)
+  status:           StreamStatus!   # monotonic; Cancelled sticky (I8)
   createdAtLedger:  LedgerSeq!
   updatedAtLedger:  LedgerSeq!
-  ttlExtendedAt:    LedgerSeq!      # last TtlExtended seen
+  ttlExtendedAt:    LedgerSeq!      # last TtlExtended seen; last-write-wins (I10)
 }
 
 type StreamCreatedEvent { streamId: BigInt!, sender: Address!, recipient: Address!, token: Address!, deposited: BigInt!, startTime: BigInt!, endTime: BigInt!, cliffTime: BigInt!, cancellable: Boolean!, pausable: Boolean!, transferable: Boolean!, ledger: LedgerSeq! }
@@ -51,6 +98,9 @@ type ToppedUpEvent    { streamId: BigInt!, sender: Address!, amount: BigInt!, de
 type RecipientTransferredEvent { streamId: BigInt!, oldRecipient: Address!, newRecipient: Address!, ledger: LedgerSeq! }
 type DelegateGrantedEvent { streamId: BigInt!, grantor: Address!, delegate: Address!, ops: Int!, expiresAt: BigInt, ledger: LedgerSeq! }
 type DelegateRevokedEvent { streamId: BigInt!, grantor: Address!, delegate: Address!, ledger: LedgerSeq! }
+# extendedToLedgers is a u32: 0 <= value <= 2^32 - 1 (I9). Out-of-range values
+# are rejected as `Overflow`. Same-ledger replays are idempotent: last-write-
+# wins on Stream.ttlExtendedAt (I10).
 type TtlExtendedEvent { streamId: BigInt!, extendedToLedgers: BigInt!, ledger: LedgerSeq! }
 
 type Query {

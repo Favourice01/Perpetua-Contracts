@@ -419,6 +419,185 @@ wrong thing.
 | assert within a justified tolerance in tests | assert exact cross-call equality against a public endpoint |
 | run your own node if you need strict read-after-write | conclude the endpoint is fine because one loop looked clean |
 
+## Keeper recovery procedure (`script/keeper-extend-ttl.sh`)
+
+The batch TTL renewal runner (`script/keeper-extend-ttl.sh`) is the place where
+read skew, Soroban state archival, and partial batch failure all meet. It sweeps
+a list of persistent entries and calls `batch_extend_ttl` on each chunk. This
+section documents the recovery procedure required by
+[#292](https://github.com/hannyloveworld/Perpetua-Contracts/issues/292): how the
+hardened script pins its reads, how it detects archived entries, how it retries
+idempotently, and what an operator does when a sweep fails partway through.
+
+### The `latestLedger` barrier before each sweep
+
+Every sweep begins with a barrier, not with a read. The script samples
+`getLatestLedger` and requires several *consecutive* samples at or above the
+target before it will build a footprint or submit anything:
+
+```bash
+# script/keeper-extend-ttl.sh (abridged)
+barrier() {
+  local target="$1" consecutive="${2:-4}" seen=0 tries=0 latest
+  while [ "$seen" -lt "$consecutive" ] && [ "$tries" -lt 40 ]; do
+    latest=$(latest_ledger)
+    if [ "$latest" -ge "$target" ]; then seen=$((seen + 1)); else seen=0; fi
+    tries=$((tries + 1)); sleep 1
+  done
+  [ "$seen" -ge "$consecutive" ] || die "RPC did not reach ledger $target"
+}
+```
+
+The target is the ledger returned by the last confirmed write (or, on a cold
+sweep, the ledger the entry list was built from). Requiring consecutive samples
+is what makes the barrier meaningful: a single passing sample only proves *one*
+backend has caught up, and the next request may land on another. The script
+records the barrier ledger in its JSON output as `barrierLedger` so a re-run can
+prove it observed the same or a later height.
+
+### Archival detection and `RestoreFootprint`
+
+A persistent entry whose TTL has already lapsed is *archived*: it is no longer
+in the live ledger, and `batch_extend_ttl` against it fails rather than
+extending it. The script detects this explicitly instead of treating it as a
+generic error:
+
+1. Before submitting, the script reads the footprint with `getLedgerEntries`.
+   Any key that comes back missing (or with a lapsed `liveUntilLedgerSeq`) is
+   classified as **archived**, not as a transient failure.
+2. Archived keys are collected and passed to a `RestoreFootprint` operation
+   before the TTL extension is retried. The script shells out to
+   [`tools/sdk/restore_footprint.ts`](../tools/sdk/restore_footprint.ts), which
+   builds the restore transaction from the same `LedgerKey` set:
+
+   ```bash
+   npx ts-node tools/sdk/restore_footprint.ts \
+     --network testnet \
+     --keys "$ARCHIVED_KEYS_JSON" \
+     --json
+   ```
+
+3. Only after the restore transaction reaches `SUCCESS` — and after the barrier
+   has advanced past the restore's committed ledger — does the script re-issue
+   `batch_extend_ttl` for the affected chunk.
+
+Restoration is itself a write, so it is subject to the same read-after-write
+rule as any other write: wait for the committed ledger, then wait for the
+endpoint to report that ledger repeatedly, *then* read or extend. Skipping the
+barrier here is how a keeper "successfully" restores an entry and then
+immediately fails to extend it because it read a replica that had not yet seen
+the restore.
+
+### Idempotent retry semantics
+
+The script is safe to re-run at any point, including after a timeout where it
+does not know whether its last submission landed. It achieves this by making
+every step idempotent:
+
+- **TTL extension is idempotent.** Extending an entry that already has a
+  sufficient `liveUntilLedgerSeq` is a no-op; the script skips keys whose
+  remaining TTL is already above the target rather than re-submitting them.
+- **Restore is idempotent.** `RestoreFootprint` on an already-live entry is a
+  no-op. Re-running the restore step for a chunk that was already restored
+  succeeds without changing state.
+- **Chunk progress is journaled.** Each chunk's outcome is written to the
+  run journal (`--journal <path>`, default `.keeper-extend-ttl.journal`) before
+  the next chunk starts. A re-run reads the journal and skips chunks already
+  marked `done`, so a partial batch failure resumes rather than restarting.
+- **Submissions are keyed, not counted.** The script identifies each chunk by
+  the sorted set of ledger keys it covers, not by its position in the list. If
+  the entry list is rebuilt between runs and the ordering changes, the journal
+  still matches chunks correctly.
+
+Because of these properties, the correct operator response to *any* uncertain
+outcome — timeout, `TRY_AGAIN_LATER`, a dropped connection mid-submit — is to
+re-run the same command. Do not hand-edit the journal, and do not assume a
+timeout means the write did not land.
+
+### Operator runbook
+
+**Detecting a partial batch failure.** Run the keeper with `--json` and inspect
+the summary. A partial failure looks like this:
+
+```bash
+$ script/keeper-extend-ttl.sh --json --network testnet --entries entries.json
+{
+  "barrierLedger": 4097076,
+  "chunks": [
+    { "id": "chunk-0", "keys": 12, "status": "done", "extended": 12 },
+    { "id": "chunk-1", "keys": 12, "status": "archived", "archived": 3 },
+    { "id": "chunk-2", "keys": 12, "status": "failed", "error": "TRY_AGAIN_LATER" }
+  ],
+  "restored": ["chunk-1"],
+  "journal": ".keeper-extend-ttl.journal",
+  "exitCode": 1
+}
+```
+
+Read it as follows:
+
+- `status: "done"` — the chunk's TTLs were extended (or were already sufficient).
+- `status: "archived"` — the chunk contained archived keys; the script attempted
+  a `RestoreFootprint` and recorded the result under `restored`. If the restore
+  itself failed, the chunk stays `archived` and the run exits non-zero.
+- `status: "failed"` — the chunk did not complete. `error` is the RPC or
+  transaction error. `TRY_AGAIN_LATER` and timeouts are retryable; a
+  `FAILED` transaction with a contract error is not, and needs investigation
+  before re-running.
+- `exitCode` — non-zero if any chunk is not `done`. A non-zero exit with some
+  chunks `done` is exactly the partial-failure case.
+
+**Re-running safely.** Re-run the identical command. The journal causes `done`
+chunks to be skipped, `archived` chunks to retry their restore, and `failed`
+chunks to be re-submitted. The barrier runs again at the start of the re-run, so
+the new sweep observes a ledger at or beyond the previous `barrierLedger`:
+
+```bash
+$ script/keeper-extend-ttl.sh --json --network testnet --entries entries.json
+{
+  "barrierLedger": 4097091,
+  "chunks": [
+    { "id": "chunk-0", "keys": 12, "status": "done", "extended": 0, "skipped": 12 },
+    { "id": "chunk-1", "keys": 12, "status": "done", "extended": 12 },
+    { "id": "chunk-2", "keys": 12, "status": "done", "extended": 12 }
+  ],
+  "restored": [],
+  "journal": ".keeper-extend-ttl.journal",
+  "exitCode": 0
+}
+```
+
+Note `chunk-0` reporting `extended: 0, skipped: 12`: those TTLs were already
+sufficient, which is the idempotency guarantee in action. `chunk-1` moved from
+`archived` to `done` because the restore succeeded and the extension was
+re-issued after the barrier advanced past the restore's ledger.
+
+**Confirming recovery.** Recovery is confirmed when a re-run exits `0` with
+every chunk `done` *and* a subsequent read of the entries shows
+`liveUntilLedgerSeq` above the target for all of them. The script's `--verify`
+flag performs that read behind a fresh barrier:
+
+```bash
+$ script/keeper-extend-ttl.sh --verify --json --network testnet --entries entries.json
+{
+  "barrierLedger": 4097092,
+  "verified": 36,
+  "belowTarget": 0,
+  "exitCode": 0
+}
+```
+
+A non-zero `belowTarget` means at least one entry is still short of its target
+TTL — re-run the sweep, and if the same entry stays short across two runs,
+inspect it directly with `getLedgerEntries` before assuming the keeper is at
+fault.
+
+**When to escalate.** Escalate rather than re-running if: a chunk fails with a
+contract error (not `TRY_AGAIN_LATER`/timeout); a restore transaction reaches
+`FAILED`; or `belowTarget` is non-zero after two clean sweeps. In those cases
+the entry may be genuinely unrecoverable, and the operator should stop the
+keeper and page the on-call engineer rather than looping.
+
 ---
 
 *Written while building [Perpetua](https://github.com/hannyloveworld/Perpetua-Contracts),

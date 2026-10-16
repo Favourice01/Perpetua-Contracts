@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "generated_by": "script/keeper-extend-ttl.sh",
+  "frozen_abi": "docs/ABI.md#ttl_extended",
+  "events": [
+    {
+      "name": "ttl_extended",
+      "contract": "keeper",
+      "topics": [
+        {
+          "index": 0,
+          "name": "event_name",
+          "type": "symbol",
+          "value": "ttl_extended"
+        },
+        {
+          "index": 1,
+          "name": "stream_id",
+          "type": "u64",
+          "value": 1
+        }
+      ],
+      "data": {
+        "extended_to_ledgers": 4294967295
+      },
+      "xdr": {
+        "topic_count": 2,
+        "data_field_count": 1
+      }
+    }
+  ],
+  "keeper_sweep_summary": {
+    "batch_index": 0,
+    "stream_ids": [1, 2, 3],
+    "extended_count": 3,
+    "ledger": 1234567
+  }
+}
+</final_file_content>

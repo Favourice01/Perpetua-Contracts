@@ -107,12 +107,52 @@ conditions.
 - [ ] Monitoring, restart policy, funding thresholds, and on-call ownership
       are documented.
 
-Operational command reference:
+#### 5.1 Hardened keeper runner verification
+
+The hardened `script/keeper-extend-ttl.sh` runner must be verified against
+archival, RPC read skew, and partial batch failure before the keeper is
+promoted to mainnet. Every item below is blocking.
+
+- [ ] **Archival detection and restore-on-archive.** The runner detects
+      archived persistent entries deterministically (no stale reads) and
+      restores the footprint via `RestoreFootprint` before extending TTLs.
+      Confirm the `ARCHIVED` classification and the restore path in the run
+      log, and that no entry is silently skipped.
+- [ ] **RPC read-skew barrier.** The runner enforces the ledger read-skew
+      barrier: it refuses to act on a snapshot whose observed ledger lags the
+      network head beyond the configured threshold, and it re-reads rather
+      than acting on skewed state. Verify the barrier triggers and recovers
+      under a simulated lag (see [soroban-rpc-read-skew.md](soroban-rpc-read-skew.md)).
+- [ ] **Idempotent retry after partial batch failure.** After a simulated
+      partial batch failure (some entries extended, some not), a re-run
+      completes the remaining entries without double-extending or corrupting
+      state. Confirm the retry is idempotent and converges to a fully extended
+      batch.
+- [ ] **`--json` sweep summary reconciliation.** The `--json` sweep summary is
+      reconciled against the indexer projection: extended, skipped, archived,
+      restored, and failed counts must agree with the indexer's view of the
+      same ledger range. Attach the reconciliation output.
+
+Run the hardened runner and the archival canary with:
 
 ```bash
 CONTRACT_ID=<mainnet-contract-id> SOURCE=<keeper-account> \
-  script/keeper-extend-ttl.sh --once
+  script/keeper-extend-ttl.sh --once --json
+
+NETWORK=testnet script/archival-canary.sh --restore
 ```
+
+Evidence to attach to the evidence bundle:
+
+- The full `--once --json` sweep summary (extended/skipped/archived/restored/
+  failed counts) and the run log showing the archival detection, restore, and
+  read-skew barrier decisions.
+- The simulated partial-batch-failure run and its idempotent retry output,
+  demonstrating convergence with no double-extension.
+- The `--json` reconciliation against the indexer projection for the same
+  ledger range, including the sampled ledger checkpoint.
+- The `script/archival-canary.sh --restore` output (network, probe contract ID,
+  ledgers, UTC timestamp) confirming the restore round trip.
 
 Record the deployment identifier, infrastructure environment, commit/image,
 last successful run, and monitoring link in the evidence bundle.
