@@ -38,8 +38,8 @@ compile_error!("stream-NFT production WASM must be built for wasm32v1-none.");
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, vec, Address, Env, FromVal, IntoVal,
-    String, Symbol, Val, Vec,
+    contract, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal, String, Symbol,
+    Val,
 };
 
 /// NFT metadata and the Perpetua stream instance this wrapper fronts.
@@ -83,6 +83,7 @@ pub enum Error {
 const STREAM_TRANSFER_RECIPIENT: &str = "transfer_recipient";
 
 fn get_config(env: &Env) -> Config {
+    bump(env, &DataKey::Config);
     env.storage()
         .instance()
         .get(&DataKey::Config)
@@ -101,16 +102,12 @@ fn bump(env: &Env, key: &DataKey) {
 /// [`Error::StreamRejected`] if the stream contract refuses (not the
 /// recipient, or the stream is not `transferable`).
 fn transfer_claim(env: &Env, config: &Config, stream_id: u64, to: &Address) {
-    let ret: Val = env.invoke_contract(
+    let result: Result<(), Val> = env.invoke_contract(
         &config.stream,
         &Symbol::new(env, STREAM_TRANSFER_RECIPIENT),
-        vec![&env, (&stream_id).into_val(env), to.into_val(env)],
+        (stream_id, to.clone()).into_val(env),
     );
-    // `Result<(), Error>` encodes as ScVec [Symbol("Ok"), Void] | [Symbol("Err"), …].
-    let parts: Vec<Val> = FromVal::from_val(env, ret);
-    let ok = Symbol::new(env, "Ok").into_val(env);
-    let accepted = parts.get(0).is_some_and(|tag| tag == ok);
-    if !accepted {
+    if result.is_err() {
         panic_with_error!(env, Error::StreamRejected);
     }
 }
@@ -165,10 +162,15 @@ impl StreamNft {
 
     /// Number of claim tokens held by `owner`.
     pub fn balance_of(env: Env, owner: Address) -> u32 {
-        env.storage()
+        let balance = env
+            .storage()
             .persistent()
-            .get(&DataKey::Balance(owner))
-            .unwrap_or(0)
+            .get(&DataKey::Balance(owner.clone()))
+            .unwrap_or(0);
+        if balance > 0 {
+            bump(&env, &DataKey::Balance(owner));
+        }
+        balance
     }
 
     /// Number of distinct claim tokens issued so far.
@@ -240,10 +242,15 @@ impl StreamNft {
             .persistent()
             .get(&DataKey::Balance(from.clone()))
             .unwrap_or(0);
-        if from_balance > 0 {
+        if from_balance == 1 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Balance(from));
+        } else if from_balance > 1 {
             env.storage()
                 .persistent()
                 .set(&DataKey::Balance(from.clone()), &(from_balance - 1));
+            bump(&env, &DataKey::Balance(from));
         }
         let to_balance: u32 = env
             .storage()
