@@ -12,8 +12,9 @@
 //! primitive that is unacceptable, so the contract engineers around it three
 //! ways:
 //!
-//! 1. **Extend on every touch.** Every function that reads or writes a stream
-//!    bumps that entry's TTL. An actively-used stream never expires.
+//! 1. **Extend after every successful mutation.** Stream state is serialized
+//!    once, then its TTL is extended once to the new schedule target. Pure
+//!    reads do not write or extend TTL.
 //! 2. **Extend generously at creation**, targeting the stream's remaining
 //!    lifetime plus a buffer, clamped to the network maximum.
 //! 3. **Permissionless top-ups** via `extend_stream_ttl`, so a keeper —or the
@@ -27,8 +28,9 @@
 //!
 //! | Entry | Lifetime | TTL target | Who bumps it |
 //! |-------|----------|-----------|--------------|
-//! | [`DataKey::NextStreamId`] (id counter) | **instance** | always the network `max_ttl()` | every mutating call |
-//! | [`DataKey::Stream(id)`] (a stream) | **persistent** | remaining life + [`TTL_BUFFER_SECONDS`], floored at [`MIN_STREAM_TTL_LEDGERS`] | every touch + keeper |
+//! | [`DataKey::NextStreamId`] and [`DataKey::StreamCount`] | **instance** | always the network `max_ttl()` | every mutating call |
+//! | [`DataKey::Stream(id)`] (a stream) | **persistent** | remaining life + [`TTL_BUFFER_SECONDS`], floored at [`MIN_STREAM_TTL_LEDGERS`] | mutation + keeper |
+//! | [`DataKey::Delegate(id, address)`] | **persistent** | network `max_ttl()` | grant creation + use |
 //!
 //! **Instance entries are always kept at maximum rent.** They are tiny, and the
 //! id counter carries the contract's monotonicity invariant: if `NextStreamId`
@@ -37,9 +39,11 @@
 //! mutating call — creation, every withdrawal, every pause, every keeper sweep.
 //!
 //! **Persistent entries target the stream's remaining lifetime.** They hold the
-//! full accounting record, so they are extended to a window that covers the
-//! stream's scheduled end plus a keeper buffer. A stream that is still settling
-//! keeps a floor of [`MIN_STREAM_TTL_LEDGERS`] so final state stays readable.
+//! full accounting record, so active streams target a window that covers their
+//! scheduled end plus a keeper buffer. Terminal streams target the floor of
+//! [`MIN_STREAM_TTL_LEDGERS`] so final state stays readable. Soroban only
+//! extends TTLs; an existing entry may remain above a reduced target until its
+//! extra TTL naturally decays.
 //!
 //! **Ordering guarantee.** [`DataKey::NextStreamId`] must *never* expire before
 //! the streams it issued. Because the instance entry is always pinned to the
@@ -54,10 +58,10 @@
 //! - **Instance `NextStreamId`** is read with a fallback of `0` (a fresh
 //!   contract), written monotonically, and always re-extended. A restored
 //!   instance correctly resumes from the last persisted id, never reusing one.
-//! - **Persistent `Stream(id)`** is read through [`load_stream`] (which bumps
-//!   TTL) or [`peek_stream`] (view-only, no write). [`stream_exists`] reports
-//!   `false` for an archived entry, which combined with the id counter lets the
-//!   contract tell "never existed" apart from "needs restoring".
+//! - **Persistent `Stream(id)`** is read through [`load_stream`] or
+//!   [`peek_stream`], neither of which writes. State writes extend the stream
+//!   once after serialization; [`stream_exists`] checks presence without
+//!   decoding the accounting record.
 //!
 //! The regression tests in `test/ttl.rs` exercise both lifetimes from seeded
 //! ledger states and assert that the instance entry cannot expire before the
@@ -165,17 +169,20 @@ pub fn ttl_target_ledgers(env: &Env, stream: &Stream) -> u32 {
 }
 
 pub fn ttl_target_ledgers_at(env: &Env, stream: &Stream, now: u64) -> u32 {
-    // A paused stream's end date slides forward in wall-clock terms, so include
-    // the accumulated pause when working out how much longer it may run.
-    let effective_end = stream
-        .end_time
-        .saturating_add(stream.paused_total)
-        .saturating_add(match stream.paused_at {
-            Some(paused_at) => now.saturating_sub(paused_at),
-            None => 0,
-        });
-
-    let remaining = effective_end.saturating_sub(now);
+    let remaining = if stream.status.is_terminal() {
+        0
+    } else {
+        // A paused stream's end date slides forward in wall-clock terms, so
+        // include accumulated and in-progress pauses in its remaining life.
+        stream
+            .end_time
+            .saturating_add(stream.paused_total)
+            .saturating_add(match stream.paused_at {
+                Some(paused_at) => now.saturating_sub(paused_at),
+                None => 0,
+            })
+            .saturating_sub(now)
+    };
     // `remaining` spans now → end_time, so for a future-dated stream the
     // pre-start wait is included in the rent target.
     let target = seconds_to_ledgers(remaining.saturating_add(TTL_BUFFER_SECONDS));
@@ -194,28 +201,91 @@ pub fn next_stream_id(env: &Env) -> u64 {
         .unwrap_or(0)
 }
 
-/// Allocate the next stream id, guarding against `u64` overflow.
-///
-/// The counter is read from instance storage, incremented with `checked_add`,
-/// and written back. If the counter is already at `u64::MAX` the increment
-/// would silently wrap to `0` and collide with live streams, so the overflow
-/// is surfaced as [`Error::StreamIdOverflow`] instead.
-///
-/// The instance entry is re-extended to the network maximum on every
-/// allocation so the id counter can never archive before the streams it
-/// issued (see the module docs on the ordering guarantee).
+/// Allocate the next id. The counter is the next id to issue, so a fresh
+/// contract returns `0`; `u64::MAX` is an exhausted sentinel and is never
+/// issued. Both counters advance in the same transaction, so a failed create
+/// rolls them back along with the rest of the invocation.
 pub fn allocate_stream_id(env: &Env) -> Result<u64, Error> {
     let current = next_stream_id(env);
-    let next = current.checked_add(1).ok_or(Error::StreamIdOverflow)?;
+    let next = current.checked_add(1).ok_or(Error::StreamIdExhausted)?;
     env.storage().instance().set(&DataKey::NextStreamId, &next);
-    extend_instance(env);
-    Ok(next)
+    env.storage().instance().set(&DataKey::StreamCount, &next);
+    Ok(current)
+}
+
+/// Number of successfully allocated stream ids.
+pub fn stream_count(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::StreamCount)
+    .unwrap_or_else(|| next_stream_id(env))
+}
+
+/// Return a stream without changing its TTL.
+pub fn peek_stream(env: &Env, stream_id: u64) -> Result<Stream, Error> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Stream(stream_id))
+        .ok_or(Error::StreamNotFound)
+}
+
+/// Load a stream without changing its persistent TTL.
+pub fn load_stream(env: &Env, stream_id: u64) -> Result<Stream, Error> {
+    peek_stream(env, stream_id)
+}
+
+/// Write a stream and extend it to the appropriate schedule-dependent target.
+pub fn save_stream(env: &Env, stream_id: u64, stream: &Stream) {
+    let key = DataKey::Stream(stream_id);
+    env.storage().persistent().set(&key, stream);
+    extend_stream(env, stream_id, stream);
+}
+
+/// Extend a stream entry to its current target without decoding it again.
+pub fn extend_stream(env: &Env, stream_id: u64, stream: &Stream) {
+    let key = DataKey::Stream(stream_id);
+    let target = ttl_target_ledgers(env, stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, target, target);
+}
+
+/// Whether the persistent stream entry is present.
+pub fn stream_exists(env: &Env, stream_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::Stream(stream_id))
+}
+
+/// Store or replace a delegate grant and fund it to the network maximum.
+pub fn save_delegate(env: &Env, stream_id: u64, delegate: &Address, grant: &DelegateGrant) {
+    let key = DataKey::Delegate(stream_id, delegate.clone());
+    env.storage().persistent().set(&key, grant);
+    let max_ttl = max_entry_ttl(env);
+    env.storage().persistent().extend_ttl(&key, max_ttl, max_ttl);
+}
+
+/// Load a delegate grant, refreshing its TTL when it exists.
+pub fn load_delegate(env: &Env, stream_id: u64, delegate: &Address) -> Option<DelegateGrant> {
+    let key = DataKey::Delegate(stream_id, delegate.clone());
+    let grant = env.storage().persistent().get(&key)?;
+    let max_ttl = max_entry_ttl(env);
+    env.storage().persistent().extend_ttl(&key, max_ttl, max_ttl);
+    Some(grant)
+}
+
+/// Remove a delegate grant. Removing a missing grant is intentionally harmless.
+pub fn remove_delegate(env: &Env, stream_id: u64, delegate: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Delegate(stream_id, delegate.clone()));
 }
 
 /// Bump the instance entry. Tiny, and it carries the id counter, so it is
 /// always extended to the network maximum.
 pub fn extend_instance(env: &Env) {
+    let max_ttl = max_entry_ttl(env);
     env.storage()
         .instance()
-        .extend_ttl(env.storage().max_ttl(), env.storage().max_ttl());
+        .extend_ttl(max_ttl, max_ttl);
 }

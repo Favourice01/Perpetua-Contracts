@@ -222,8 +222,9 @@ fn a_matured_stream_keeps_a_floor_of_rent() {
     let id = h.create_simple(1_000 * ONE, 10 * DAY);
     h.warp_to(T0 + 100 * DAY);
 
-    h.client.extend_stream_ttl(&id);
-    assert_eq!(ttl_of(&h, id), storage::MIN_STREAM_TTL_LEDGERS);
+    let target = h.client.extend_stream_ttl(&id);
+    assert_eq!(target, storage::MIN_STREAM_TTL_LEDGERS);
+    assert_eq!(ttl_of(&h, id), target);
 }
 
 /// A paused stream's end date slides forward in wall-clock terms, so its rent
@@ -263,13 +264,15 @@ fn a_cancelled_stream_decays_to_the_floor() {
     h.advance(10 * DAY);
     h.client.cancel(&id);
 
+    let existing_ttl = ttl_of(&h, id);
     let target = h.client.extend_stream_ttl(&id);
     assert_eq!(
         target,
         storage::MIN_STREAM_TTL_LEDGERS,
         "cancelled stream must target the 30-day floor",
     );
-    assert_eq!(ttl_of(&h, id), storage::MIN_STREAM_TTL_LEDGERS);
+    assert!(existing_ttl > target);
+    assert_eq!(ttl_of(&h, id), existing_ttl);
 
     // The floor is strictly below what an active stream of this length would
     // have been funded for, proving we are not re-funding the schedule.
@@ -296,7 +299,7 @@ fn a_depleted_stream_decays_to_the_floor() {
         storage::MIN_STREAM_TTL_LEDGERS,
         "depleted stream must target the 30-day floor",
     );
-    assert_eq!(ttl_of(&h, id), storage::MIN_STREAM_TTL_LEDGERS);
+    assert_eq!(ttl_of(&h, id), target);
 }
 
 /// An active stream must keep its full schedule-lifetime rent target; the

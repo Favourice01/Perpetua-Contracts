@@ -7,12 +7,12 @@
 //! successful or not — and exercises the two ways a create can fail:
 //!
 //! * **Validation rejection** — `create_stream` returns before ever calling
-//!   `storage::next_stream_id`, so the counter is untouched by construction.
+//!   `storage::allocate_stream_id`, so the counter is untouched by construction.
 //! * **A failed deposit transfer** — the counter *has* been bumped and the
 //!   `Stream` entry *has* been written by the time the token transfer runs.
 //!   This only stays safe because a Soroban invocation is atomic: an `Err`
 //!   return unwinds every storage write the call made, not merely the token
-//!   transfer. See `storage::next_stream_id` for the full argument.
+//!   transfer. See `storage::allocate_stream_id` for the full argument.
 //!
 //! Transfers and top-ups are interleaved throughout to confirm that mutating
 //! an *existing* stream never perturbs id allocation for the next create.
@@ -21,7 +21,7 @@
 //!
 //! Ids are global — one instance-level counter shared by every sender, not
 //! namespaced per sender and not derived from any stream field. See
-//! `storage::next_stream_id` for the rationale and how gaps (there are none)
+//! `storage::allocate_stream_id` for the rationale and how gaps (there are none)
 //! are handled.
 
 use super::common::*;

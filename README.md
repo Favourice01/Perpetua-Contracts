@@ -310,6 +310,13 @@ Views deliberately do **not** extend TTL. They are called through simulation,
 where a footprint write is at best noise. Keeping a stream alive is the explicit
 job of `extend_stream_ttl`.
 
+Storage reads used by mutations are also pure: each successful stream write
+extends the entry once, after the updated schedule and lifecycle state are
+known. Delegate grants use their own persistent entries and are extended on
+grant creation and use. Soroban TTLs only increase, so moving a stream into a
+terminal state lowers its target to the floor but does not claw back rent that
+was already paid; the extra TTL decays naturally.
+
 ### Retention policy by state
 
 Every touch tops the entry back up to one target — the stream's remaining
