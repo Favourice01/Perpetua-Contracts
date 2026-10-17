@@ -1,5 +1,5 @@
 {
-  "abi_version": 1,
+  "abi_version": 2,
   "functions": [
     {
       "name": "batch_extend_ttl",
@@ -226,11 +226,10 @@
       "name": "Stream",
       "kind": "struct",
       "fields": [
-        {"name": "cancellable", "type": "bool"},
         {"name": "cliff_time", "type": "u64"},
         {"name": "deposited", "type": "i128"},
         {"name": "end_time", "type": "u64"},
-        {"name": "pausable", "type": "bool"},
+        {"name": "flags", "type": "u32"},
         {"name": "paused_at", "type": "Option<u64>"},
         {"name": "paused_total", "type": "u64"},
         {"name": "recipient", "type": "Address"},
@@ -238,7 +237,6 @@
         {"name": "start_time", "type": "u64"},
         {"name": "status", "type": "StreamStatus"},
         {"name": "token", "type": "Address"},
-        {"name": "transferable", "type": "bool"},
         {"name": "withdrawn", "type": "i128"}
       ],
       "cases": [
@@ -288,7 +286,10 @@
     {"name": "DelegateExpired", "discriminant": 28},
     {"name": "MalformedStreamId", "discriminant": 29},
     {"name": "RepeatedTransfer", "discriminant": 30},
-    {"name": "InvalidTopUp", "discriminant": 31}
+    {"name": "InvalidTopUp", "discriminant": 31},
+    {"name": "DepositTooSmall", "discriminant": 32},
+    {"name": "StreamIdOverflow", "discriminant": 33},
+    {"name": "BatchSizeExceeded", "discriminant": 34}
   ],
   "events": [
     {

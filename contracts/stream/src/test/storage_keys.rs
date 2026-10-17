@@ -705,7 +705,7 @@ const OLD_V1_STREAM_FIXTURE_HEX: &str = "00000011000000010000000e0000000f0000000
 ///
 /// The bitmask packing deliberately changed the serialized `Stream` schema:
 /// the three `bool` fields `cancellable`/`pausable`/`transferable` became a
-/// single `u8 flags` field, so a stream entry written by a pre-#119 build can
+/// single `u32 flags` field, so a stream entry written by a pre-#119 build can
 /// no longer be decoded by the current reader without a migration. The fixture
 /// below is frozen as documentation of that old encoding and the decode run is
 /// disabled; re-enable it once the migration path for existing entries is

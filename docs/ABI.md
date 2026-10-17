@@ -1,6 +1,6 @@
 # Perpetua ABI — interface of record
 
-**Status: FROZEN as of 2026-08-12, ahead of stage 5.**
+**Deployed v1 status: FROZEN as of 2026-08-12. Local source ABI: v2.**
 
 This document is the interface contract between `Perpetua-Contracts` and every
 consumer — `Perpetua-Backend`, `Perpetua-Frontend`, `fluxora-sdk`, and third-party
@@ -40,6 +40,11 @@ So the freeze is a commitment about how we manage that:
 
 Consumers should pin the wasm hash above and treat a change in it as requiring
 a review of this document.
+
+The local source now declares `ABI_VERSION = 2`. This is a new deployment
+candidate, not the deployed v1 interface: its packed `Stream.flags` field
+changes the serialized struct layout. The deployed hash and spec hash above
+continue to describe v1 until a v2 WASM build is produced and verified.
 
 ### How to change the interface
 
@@ -103,14 +108,17 @@ struct Stream {
     start_time: u64,       // unix seconds
     end_time: u64,         // unix seconds
     cliff_time: u64,       // in [start_time, end_time]; == start_time for none
-    cancellable: bool,     // immutable after creation
-    pausable: bool,        // immutable after creation
-    transferable: bool,    // immutable after creation
+      flags: u32,            // immutable: CANCELLABLE=1, PAUSABLE=2, TRANSFERABLE=4
     paused_at: Option<u64>,
     paused_total: u64,     // cumulative paused seconds, excluding any in-progress pause
     status: StreamStatus,
 }
 ```
+
+The v2 `Stream` layout is not decodable from v1 persistent entries: the former
+three boolean fields were replaced by `flags`. A deployment that must preserve
+v1 streams needs an explicit migration/decoder before switching readers; a new
+immutable deployment cannot transparently reinterpret those entries.
 
 All amounts are `i128` in the token's smallest unit. **USDC on Stellar has 7
 decimals** — not 6, not 18. Amounts cross the JSON-RPC boundary as *strings*
@@ -156,6 +164,8 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | | | | 29 | `MalformedStreamId` |
 | | | | 30 | `RepeatedTransfer` |
 | | | | 31 | `InvalidTopUp` |
+| 32 | `DepositTooSmall` | | 33 | `StreamIdOverflow` |
+| 34 | `BatchSizeExceeded` | | | |
 
 `TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Perpetua's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
