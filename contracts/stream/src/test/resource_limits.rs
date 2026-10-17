@@ -28,7 +28,7 @@
 //!
 //! # What each measurement covers
 //!
-//! Every invocation here reports and then bounds four resource dimensions:
+//! Every invocation here reports six resource dimensions:
 //!
 //! * **CPU** — `instructions`, the modelled CPU instruction count.
 //! * **Disk reads** — `disk_read_entries`, entries restored from disk. Live
@@ -36,10 +36,12 @@
 //! * **Memory** — `memory_read_entries`, the in-memory ledger entries accessed
 //!   (live Soroban state is held in memory, not re-read from disk).
 //! * **Storage writes** — `write_entries`, the entries written to the ledger.
+//! * **Linear memory** — `mem_bytes`, the host's metered allocation budget.
+//! * **Events** — `contract_events_size_bytes`, the encoded event footprint.
 //!
-//! The deterministic max/max+1 boundary tests below assert *all four* at the
-//! cap, and that one past the cap is rejected with [`Error::BatchTooLarge`]
-//! before any partial mutation.
+//! The deterministic max/max+1 boundary tests below assert all four ledger
+//! resource dimensions at the cap, and that one past the cap is rejected with
+//! [`Error::BatchTooLarge`] before any partial mutation.
 //!
 //! # Caveats on the numbers
 //!
@@ -73,15 +75,14 @@ struct Cost {
     disk_reads: u32,
     writes: u32,
     memory: u32,
+    mem_bytes: u64,
     instructions: i64,
     event_bytes: u32,
 }
 
 /// Report and return the last invocation's cost. Every resource dimension the
-/// issue asks about — CPU ([`Cost::instructions`]), disk reads
-/// ([`Cost::disk_reads`]), memory ([`Cost::memory`], the in-memory ledger
-/// entries accessed), and storage writes ([`Cost::writes`]) — is surfaced so
-/// regressions are visible.
+/// issue asks about — CPU, ledger access, linear-memory allocation, storage
+/// writes, and event bytes — is surfaced so regressions are visible.
 fn report(h: &Harness, label: &str) -> Cost {
     let r = h.env.cost_estimate().resources();
     let cost = Cost {
@@ -89,17 +90,19 @@ fn report(h: &Harness, label: &str) -> Cost {
         disk_reads: r.disk_read_entries,
         writes: r.write_entries,
         memory: r.memory_read_entries,
+        mem_bytes: r.mem_bytes,
         instructions: r.instructions,
         event_bytes: r.contract_events_size_bytes,
     };
     std::println!(
         "{label:<26} footprint={:<4}/{LEDGER_ENTRY_LIMIT}  disk={:<4}/{DISK_READ_ENTRY_LIMIT}  \
-         writes={:<4}/{WRITE_ENTRY_LIMIT}  mem={:<4}  events={:<6}/{EVENT_BYTES_LIMIT}  \
+         writes={:<4}/{WRITE_ENTRY_LIMIT}  mem={:<4}  alloc={:<8} bytes  events={:<6}/{EVENT_BYTES_LIMIT}  \
          instructions={}",
         cost.footprint,
         cost.disk_reads,
         cost.writes,
         cost.memory,
+        cost.mem_bytes,
         cost.event_bytes,
         cost.instructions,
     );
@@ -249,6 +252,12 @@ fn batch_cost_grows_linearly_and_not_faster() {
             "footprint grew faster than linearly: {size} items took {} vs {} for one",
             cost.footprint,
             base.footprint,
+        );
+        assert!(
+            cost.mem_bytes <= base.mem_bytes * size as u64,
+            "memory grew faster than linearly: {size} items used {} bytes vs {} bytes for one",
+            cost.mem_bytes,
+            base.mem_bytes,
         );
     }
 }
