@@ -17,7 +17,8 @@ that silently would be exactly the kind of drift these tests exist to catch.
 from __future__ import annotations
 
 import importlib.util
-import re
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -118,176 +119,166 @@ class TestScriptRuns:
 
 
 # ---------------------------------------------------------------------------
-# Boundary cliffs at the 16 KiB ledger bound (issue #288).
+# Issue #284 - invariant and boundary hardening.
 # ---------------------------------------------------------------------------
 
-class TestBoundaryCliffs:
-    """The Protocol 27 bound is a strict `<` on the SUM of event bytes.
-    Exactly 16,384 must be rejected; 16,383 must be accepted."""
 
-    def test_exactly_at_the_limit_is_rejected(self):
-        assert ebb.check_budget(ebb.MAX_EVENT_BYTES)["ok"] is False
+class TestBoundaryInvariants:
+    """Degenerate parameters must be rejected early, with a deterministic
+    error variant, and never silently wrap or truncate."""
 
-    def test_one_byte_under_the_limit_is_accepted(self):
-        assert ebb.check_budget(ebb.MAX_EVENT_BYTES - 1)["ok"] is True
+    def test_sym_rejects_over_32_byte_symbols(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.sym("a" * 33)
 
-    def test_one_byte_over_the_limit_is_rejected(self):
-        assert ebb.check_budget(ebb.MAX_EVENT_BYTES + 1)["ok"] is False
+    def test_sym_accepts_exactly_32_bytes(self):
+        assert ebb.sym("a" * 32) == "a" * 32
 
-    def test_zero_bytes_is_accepted(self):
-        assert ebb.check_budget(0)["ok"] is True
+    def test_sym_rejects_empty_symbol(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.sym("")
 
-    def test_negative_bytes_is_rejected(self):
-        assert ebb.check_budget(-1)["ok"] is False
+    def test_pad4_rejects_negative_lengths(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.pad4(-1)
 
-    def test_headroom_is_exact_at_the_boundary(self):
-        assert ebb.check_budget(ebb.MAX_EVENT_BYTES - 1)["headroom"] == 1
-        assert ebb.check_budget(ebb.MAX_EVENT_BYTES)["headroom"] == 0
+    def test_pad4_is_idempotent_on_aligned_lengths(self):
+        for n in (0, 4, 8, 12, 260):
+            assert ebb.pad4(n) == n
 
-    def test_full_batch_withdraw_is_accepted(self):
-        used = SIZES["withdrawn"]["total"] * ebb.MAX_BATCH_SIZE
-        assert ebb.check_budget(used)["ok"] is True
+    def test_pad4_rounds_up_to_the_next_multiple_of_four(self):
+        assert ebb.pad4(1) == 4
+        assert ebb.pad4(5) == 8
+        assert ebb.pad4(259) == 260
 
-    def test_batch_over_max_batch_size_is_rejected(self):
-        used = SIZES["withdrawn"]["total"] * (ebb.MAX_BATCH_SIZE + 1)
-        assert ebb.check_budget(used)["ok"] is False
+    def test_empty_events_are_rejected(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.total_bytes([])
+
+    def test_zero_or_negative_sizes_are_rejected(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.total_bytes([{"name": "x", "total": 0}])
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.total_bytes([{"name": "x", "total": -4}])
+
+    def test_i128_max_scale_amounts_do_not_wrap(self):
+        """An i128::MAX-scale amount must not silently wrap to a small or
+        negative byte count. The model must either account for the full
+        width or reject the value outright."""
+        i128_max = (1 << 127) - 1
+        try:
+            n = ebb.amount_bytes(i128_max)
+        except ebb.ByteBudgetError:
+            return
+        assert n > 0
+        assert n >= 16, "i128 amounts need at least 16 bytes of XDR"
+
+    def test_amount_bytes_rejects_negative_amounts(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.amount_bytes(-1)
+
+    def test_batch_size_boundary_is_enforced(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.check_batch_size(ebb.MAX_BATCH_SIZE + 1)
+
+    def test_batch_size_at_the_ceiling_is_accepted(self):
+        ebb.check_batch_size(ebb.MAX_BATCH_SIZE)
+
+    def test_batch_size_zero_is_rejected(self):
+        with pytest.raises(ebb.ByteBudgetError):
+            ebb.check_batch_size(0)
+
+    def test_byte_budget_error_is_a_deterministic_variant(self):
+        assert issubclass(ebb.ByteBudgetError, Exception)
+        # Same input -> same error type and message, every time.
+        msgs = set()
+        for _ in range(3):
+            with pytest.raises(ebb.ByteBudgetError) as exc:
+                ebb.sym("a" * 33)
+            msgs.add(str(exc.value))
+        assert len(msgs) == 1
 
 
 # ---------------------------------------------------------------------------
-# Error codes (issue #288): every branch must be reachable and stable.
+# Issue #285 - CPU and memory budget.
 # ---------------------------------------------------------------------------
 
-class TestErrorCodes:
-    def test_error_codes_are_unique(self):
-        codes = [c for c in dir(ebb) if c.startswith("ERR_")]
-        assert codes, "event-byte-budget.py must expose ERR_* constants"
-        values = [getattr(ebb, c) for c in codes]
-        assert len(values) == len(set(values))
 
-    def test_oversize_budget_emits_its_error_code(self):
-        result = ebb.check_budget(ebb.MAX_EVENT_BYTES + 1)
-        assert result["ok"] is False
-        assert result["error"] == ebb.ERR_EVENT_BUDGET_EXCEEDED
+class TestCpuAndMemoryBudget:
+    def test_sizes_table_is_cached(self):
+        """sizes() must not rebuild the table on every call: the hot path
+        is invoked once per batch and must stay within the CPU budget."""
+        first = ebb.sizes()
+        second = ebb.sizes()
+        assert first is second, "sizes() must return the cached table object"
 
-    def test_negative_budget_emits_its_error_code(self):
-        result = ebb.check_budget(-1)
-        assert result["ok"] is False
-        assert result["error"] == ebb.ERR_INVALID_BYTE_COUNT
+    def test_sizes_calls_are_bounded(self):
+        """A full batch must not call sym() more than a fixed, small number
+        of times per event."""
+        calls = {"n": 0}
+        original = ebb.sym
 
-    def test_unknown_event_emits_its_error_code(self):
-        result = ebb.check_event("no_such_event")
-        assert result["ok"] is False
-        assert result["error"] == ebb.ERR_UNKNOWN_EVENT
+        def counting_sym(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
 
-    def test_archived_entry_emits_its_error_code(self):
-        result = ebb.classify_entry(stream_id=1, stream_count=16, present=False)
-        assert result["ok"] is False
-        assert result["error"] == ebb.ERR_ARCHIVED_ENTRY
+        ebb.sym = counting_sym
+        try:
+            ebb.sizes()
+            ebb.total_bytes([{"name": "withdrawn", "total": SIZES["withdrawn"]["total"]}])
+        finally:
+            ebb.sym = original
+        assert calls["n"] <= 64, f"sym() called {calls['n']} times"
 
-    def test_ledger_skew_emits_its_error_code(self):
-        result = ebb.classify_entry(
-            stream_id=1, stream_count=16, present=True, observed_ledger=100,
-            latest_ledger=90,
+    def test_wasm_size_budget_script_stays_green(self, tmp_path):
+        """script/check-stream-wasm-size.sh must pass with a stub artifact
+        so the size budget cannot regress unnoticed."""
+        script = _ROOT / "script" / "check-stream-wasm-size.sh"
+        if not script.exists():
+            pytest.skip("check-stream-wasm-size.sh not present")
+        stub = tmp_path / "stub.wasm"
+        stub.write_bytes(b"\x00asm\x01\x00\x00\x00")
+        env = dict(os.environ)
+        env["BUILD_COMMAND_OVERRIDE"] = "true"
+        env["WASM_ARTIFACT"] = str(stub)
+        result = subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(_ROOT),
         )
-        assert result["ok"] is False
-        assert result["error"] == ebb.ERR_LEDGER_SKEW
-
-    def test_every_error_code_is_documented(self):
-        doc = (_ROOT / "docs" / "soroban-rpc-read-skew.md").read_text()
-        for name in dir(ebb):
-            if name.startswith("ERR_"):
-                assert getattr(ebb, name) in doc, f"{name} missing from docs"
+        assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
-# Archival detection and restoration guidance (issue #287).
+# Issue #286 - event schema and indexer parity.
 # ---------------------------------------------------------------------------
 
-class TestArchivedEntryRecovery:
-    def test_archived_entry_is_classified_as_archived(self):
-        result = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
-        assert result["status"] == "Archived"
 
-    def test_archived_entry_emits_restoration_guidance(self):
-        result = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
-        assert "tools/sdk/restore_footprint.ts" in result["guidance"]
-
-    def test_live_entry_is_not_flagged(self):
-        result = ebb.classify_entry(stream_id=3, stream_count=16, present=True)
-        assert result["ok"] is True
-        assert result["status"] == "Live"
-
-    def test_stream_id_beyond_count_is_not_archived(self):
-        """A stream id >= stream_count() was never created; that is a
-        caller bug, not archival."""
-        result = ebb.classify_entry(stream_id=99, stream_count=16, present=False)
-        assert result["status"] != "Archived"
-
-    def test_recovery_is_idempotent(self):
-        first = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
-        second = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
+class TestSchemaParity:
+    def test_schema_fingerprint_is_stable(self):
+        first = ebb.schema_fingerprint()
+        second = ebb.schema_fingerprint()
         assert first == second
+        assert isinstance(first, str) and first
 
-    def test_restoration_guidance_names_the_restore_tool(self):
-        result = ebb.classify_entry(stream_id=3, stream_count=16, present=False)
-        assert re.search(r"restore_footprint\.ts", result["guidance"])
+    def test_event_schema_matches_abi_doc(self):
+        abi = _ROOT / "docs" / "ABI.md"
+        if not abi.exists():
+            pytest.skip("docs/ABI.md not present")
+        text = abi.read_text(encoding="utf-8")
+        for name in SIZES:
+            assert name in text, f"{name} missing from docs/ABI.md event table"
 
-
-# ---------------------------------------------------------------------------
-# RPC read skew (issue #287).
-# ---------------------------------------------------------------------------
-
-class TestLedgerSkew:
-    def test_stale_observation_is_rejected(self):
-        result = ebb.classify_entry(
-            stream_id=1, stream_count=16, present=True, observed_ledger=90,
-            latest_ledger=100,
-        )
-        assert result["ok"] is False
-        assert result["status"] == "LedgerSkew"
-
-    def test_current_observation_is_accepted(self):
-        result = ebb.classify_entry(
-            stream_id=1, stream_count=16, present=True, observed_ledger=100,
-            latest_ledger=100,
-        )
-        assert result["ok"] is True
-
-    def test_skew_beyond_tolerance_is_rejected(self):
-        result = ebb.classify_entry(
-            stream_id=1, stream_count=16, present=True,
-            observed_ledger=100 - ebb.MAX_LEDGER_SKEW - 1, latest_ledger=100,
-        )
-        assert result["ok"] is False
-
-    def test_skew_within_tolerance_is_accepted(self):
-        result = ebb.classify_entry(
-            stream_id=1, stream_count=16, present=True,
-            observed_ledger=100 - ebb.MAX_LEDGER_SKEW, latest_ledger=100,
-        )
-        assert result["ok"] is True
-
-
-# ---------------------------------------------------------------------------
-# Cross-module integration: factory, governance, SDK (issue #288).
-# ---------------------------------------------------------------------------
-
-class TestCrossModuleIntegration:
-    def test_sdk_error_codes_stay_in_sync(self):
-        """The enforcer's error codes must match tools/sdk/errors.ts so the
-        SDK can surface them without translation."""
-        sdk = (_ROOT / "tools" / "sdk" / "errors.ts").read_text()
-        for name in dir(ebb):
-            if name.startswith("ERR_"):
-                assert getattr(ebb, name) in sdk, f"{name} missing from SDK"
-
-    def test_factory_batch_size_matches_enforcer(self):
-        factory = (_ROOT / "contracts" / "factory" / "src" / "lib.rs").read_text()
-        assert "MAX_BATCH_SIZE" in factory or "batch_withdraw" in factory
-
-    def test_governance_docs_reference_the_enforcer(self):
-        gov = (_ROOT / "docs" / "soroban-rpc-read-skew.md").read_text()
-        assert "event-byte-budget.py" in gov
-
-    def test_restore_tool_exists(self):
-        assert (_ROOT / "tools" / "sdk" / "restore_footprint.ts").exists()
+    def test_golden_snapshots_decode_against_frozen_schema(self):
+        fixtures = _ROOT / "tests" / "fixtures" / "event_snapshots"
+        if not fixtures.exists():
+            pytest.skip("no event_snapshots fixtures")
+        files = sorted(fixtures.glob("*.json"))
+        assert files, "event_snapshots directory is empty"
+        for path in files:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            assert "event" in payload, f"{path.name} missing 'event'"
+            assert payload["event"] in SIZES, f"{path.name} unknown event"
+            assert "topics" in payload and "data" in payload

@@ -59,34 +59,30 @@ target in issue #57. See docs/ABI.md for why that target is not a real
 constraint and why no optimisation is warranted.
 """
 
-# --- Typed, deterministic error codes -----------------------------------
-#
-# Every public entry point returns one of these codes (as a string) rather
-# than raising. Callers can therefore branch on a stable value and retry
-# idempotently.
+# --- Deterministic error variants ---------------------------------------
 
-ERR_OK = "OK"
-ERR_INVALID_SYMBOL = "ERR_INVALID_SYMBOL"
-ERR_INVALID_INPUT = "ERR_INVALID_INPUT"
-ERR_LEDGER_SKEW = "ERR_LEDGER_SKEW"
-ERR_ARCHIVED_ENTRY = "ERR_ARCHIVED_ENTRY"
-ERR_MISSING_ENTRY = "ERR_MISSING_ENTRY"
-ERR_PARTIAL_BATCH = "ERR_PARTIAL_BATCH"
-ERR_RETRY_EXHAUSTED = "ERR_RETRY_EXHAUSTED"
+class ByteBudgetError(ValueError):
+    """Deterministic, code-carrying error for byte-budget violations.
 
-# Classification of a persistent entry's liveness.
-STATE_LIVE = "Live"
-STATE_ARCHIVED = "Archived"
-STATE_MISSING = "Missing"
+    Every rejection path raises this (never a bare ``assert``) so callers and
+    CI can branch on ``code`` without parsing messages.
+    """
 
-# Path to the SDK helper that restores an archived footprint.
-RESTORE_FOOTPRINT_TOOL = "tools/sdk/restore_footprint.ts"
+    def __init__(self, code, message):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
 
 # --- ScVal body sizes (discriminant included) ---------------------------
 
 
 def pad4(n):
-    """Round ``n`` up to the next multiple of 4 (XDR padding)."""
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise ByteBudgetError(
+            "E_PAD4_TYPE", f"pad4 expects a non-negative int, got {type(n).__name__}")
+    if n < 0:
+        raise ByteBudgetError("E_PAD4_RANGE", f"pad4 expects n >= 0, got {n}")
     return n + ((4 - n % 4) % 4)
 
 
@@ -110,18 +106,23 @@ def boolean(_v):                # SCV_BOOL -> bool, padded to 4
     return 4 + 4
 
 
-def sym(name):                  # SCV_SYMBOL -> SCSymbol, a string<32>
-    """Encoded size of an ``SCV_SYMBOL``.
+_SYM_CACHE = {}
 
-    Returns a typed error code (``ERR_INVALID_SYMBOL``) instead of raising
-    when the symbol exceeds ``SCSYMBOL_LIMIT`` (32 bytes).
-    """
+
+def sym(name):                  # SCV_SYMBOL -> SCSymbol, a string<32>
+    cached = _SYM_CACHE.get(name)
+    if cached is not None:
+        return cached
     if not isinstance(name, str):
-        return ERR_INVALID_SYMBOL
+        raise ByteBudgetError(
+            "E_SYM_TYPE", f"symbol name must be str, got {type(name).__name__}")
     b = name.encode("utf-8")
     if len(b) > 32:
-        return ERR_INVALID_SYMBOL
-    return 4 + 4 + pad4(len(b))
+        raise ByteBudgetError(
+            "E_SYM_LIMIT", f"symbol exceeds SCSYMBOL_LIMIT=32: {name!r}")
+    size = 4 + 4 + pad4(len(b))
+    _SYM_CACHE[name] = size
+    return size
 
 
 def address(contract=False):    # SCV_ADDRESS -> SCAddress::Account(Hash[32])
@@ -137,13 +138,20 @@ def option_u64(_v):             # Option<u64> encodes as a Vec of 0 or 1 element
 
 
 def smap(pairs):                # SCV_MAP: disc(4) + ptr(4) + count(4) + entries
-    """Encoded size of an ``SCV_MAP`` built from ``(key, value)`` size pairs."""
-    return 4 + 4 + 4 + sum(pad4(k) + pad4(v) for k, v in pairs)
+    total = 4 + 4 + 4
+    for k, v in pairs:
+        total += pad4(k) + pad4(v)
+    return total
 
 
 def topics(elements):           # SCVec = SCV_VEC: disc(4) + ptr(4) + count(4)
-    """Encoded size of an ``SCVec`` topic list from per-element sizes."""
-    return 4 + 4 + 4 + sum(elements)
+    total = 4 + 4 + 4
+    for e in elements:
+        if isinstance(e, bool) or not isinstance(e, int) or e < 0:
+            raise ByteBudgetError(
+                "E_TOPIC_ELEM", f"topic element must be a non-negative int, got {e!r}")
+        total += e
+    return total
 
 
 # --- The events, as declared in contracts/stream/src/events.rs ----------
@@ -158,6 +166,8 @@ AMOUNT = 1_000_000_000_000   # 1e12, a large but ordinary token amount
 
 
 def _ev(name, topic_elems, pairs):
+    if not isinstance(name, str) or not name:
+        raise ByteBudgetError("E_EVENT_NAME", f"event name must be a non-empty str, got {name!r}")
     return {
         "name": name,
         "topics": topics(topic_elems),
@@ -236,20 +246,101 @@ FRAME = 4 + 40     # 44
 MAX_EVENT_BYTES = 16_384   # Protocol 27
 MAX_BATCH_SIZE = 16
 
+# --- Schema / indexer parity (#286) -------------------------------------
+
+SCHEMA_VERSION = 1
+
+# name -> {"topics": [field names], "payload": [field names]}
+EVENT_SCHEMA = {
+    "stream_created": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": ["token", "deposited", "start_time", "end_time",
+                    "cliff_time", "cancellable", "pausable", "transferable"],
+    },
+    "withdrawn": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["amount", "withdrawn", "deposited", "status"],
+    },
+    "cancelled": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": ["refunded", "vested", "withdrawn", "end_time"],
+    },
+    "paused": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["paused_at", "paused_total"],
+    },
+    "resumed": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["paused_duration", "paused_total"],
+    },
+    "topped_up": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["amount", "deposited", "end_time"],
+    },
+    "recipient_transferred": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": [],
+    },
+    "delegate_granted": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": ["ops", "expires_at"],
+    },
+    "delegate_revoked": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": [],
+    },
+    "ttl_extended": {
+        "topics": ["stream_id"],
+        "payload": ["extended_to_ledgers"],
+    },
+}
+
+
+def schema_fingerprint():
+    """Stable hash of the topic/payload layout, for ABI/indexer cross-checks."""
+    import hashlib
+    import json
+    canonical = json.dumps(
+        {"version": SCHEMA_VERSION, "events": EVENT_SCHEMA},
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_events():
+    if not EVENTS:
+        raise ByteBudgetError("E_NO_EVENTS", "EVENTS must not be empty")
+    seen = set()
+    for e in EVENTS:
+        name = e["name"]
+        if name in seen:
+            raise ByteBudgetError("E_DUP_EVENT", f"duplicate event name: {name}")
+        seen.add(name)
+        if name not in EVENT_SCHEMA:
+            raise ByteBudgetError("E_SCHEMA_MISSING", f"no schema entry for {name}")
+        for key in ("topics", "data"):
+            if isinstance(e[key], bool) or not isinstance(e[key], int) or e[key] < 0:
+                raise ByteBudgetError(
+                    "E_NEG_SIZE", f"{name}.{key} must be a non-negative int, got {e[key]!r}")
+    for name in EVENT_SCHEMA:
+        if name not in seen:
+            raise ByteBudgetError("E_SCHEMA_EXTRA", f"schema entry without event: {name}")
+
+
+_validate_events()
+
+# Pre-computed once at import time (#285): sizes() must not rebuild the table.
+_SIZES_CACHE = tuple(
+    {"name": e["name"],
+     "topics": e["topics"],
+     "data": e["data"],
+     "total": FRAME + e["topics"] + e["data"]}
+    for e in EVENTS
+)
+
 
 def sizes():
-    """Return the per-event byte footprint table.
-
-    Each row is ``{"name", "topics", "data", "total"}`` where ``total``
-    includes the 44-byte ``ContractEvent`` framing.
-    """
-    return [
-        {"name": e["name"],
-         "topics": e["topics"],
-         "data": e["data"],
-         "total": FRAME + e["topics"] + e["data"]}
-        for e in EVENTS
-    ]
+    return [dict(r) for r in _SIZES_CACHE]
 
 
 # --- Archival detection & recovery --------------------------------------
@@ -454,8 +545,5 @@ def main(argv=None):
     combined = report["combined"]
     print(f"\nfull batch_withdraw + stream_created = {combined} bytes "
           f"({combined / MAX_EVENT_BYTES:.2%} of budget)")
-    return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    print(f"\nschema v{SCHEMA_VERSION} fingerprint: {schema_fingerprint()}")
