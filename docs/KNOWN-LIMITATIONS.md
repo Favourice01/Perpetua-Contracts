@@ -163,6 +163,28 @@ fail. Detect it (`stream_exists() == false` with `stream_id < stream_count()`)
 and surface a restore action rather than an error toast. Run a keeper against
 `batch_extend_ttl` so it rarely comes up.
 
+### Off-chain schema: archival detection and recovery semantics
+
+The off-chain indexer schema — `schema/schema.graphql` and `schema/schema.sql` —
+carries the same recovery contract as the on-chain SDK, so an indexer can detect
+and repair an archived entry without guessing:
+
+- Both schemas expose an `archived` marker on stream rows/entities, plus an
+  idempotent retry key so a recovery attempt can be replayed safely after a
+  failed or timed-out invocation.
+- The indexer must detect an archived entry with the same predicate the SDK
+  uses: `stream_exists == false && id < stream_count()`. That combination — a
+  gap below the count rather than a genuinely absent stream — is the
+  "needs restoring" signal, and the indexer must surface a restore action
+  rather than treating it as a missing stream.
+- The recovery path is verified by `tests/test_event_reconstruction.py` and
+  `tools/sdk/restore_footprint.test.ts`, which cover archived-entry restoration
+  and ledger skew between the RPC read and the indexed head.
+
+The schema's archival handling is deterministic: an archived entry is marked,
+never dropped or silently rewritten, and replaying a recovery attempt under the
+idempotent retry key converges on the same row. It does not corrupt data.
+
 ---
 
 ## 2. Resource measurements understate a real deployment

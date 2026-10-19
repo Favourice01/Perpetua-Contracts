@@ -52,6 +52,8 @@ STREAM_SRC = REPO_ROOT / "contracts" / "stream" / "src"
 EVENTS_RS = STREAM_SRC / "events.rs"
 LIB_RS = STREAM_SRC / "lib.rs"
 ABI_MD = REPO_ROOT / "docs" / "ABI.md"
+GRAPHQL_SCHEMA = REPO_ROOT / "schema" / "schema.graphql"
+SQL_SCHEMA = REPO_ROOT / "schema" / "schema.sql"
 
 
 class CheckError(RuntimeError):
@@ -324,6 +326,162 @@ def check_freeze_status(document: str) -> list[str]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Off-chain schema extraction (GraphQL + SQL)
+# ---------------------------------------------------------------------------
+
+
+def _graphql_block(source: str, keyword: str, name: str) -> str | None:
+    """Return the body of `keyword name { ... }`, or None when absent."""
+    match = re.search(rf"\b{keyword}\s+{re.escape(name)}\b[^{{]*\{{", source)
+    if not match:
+        return None
+    depth = 1
+    idx = match.end()
+    start = idx
+    while idx < len(source) and depth:
+        if source[idx] == "{":
+            depth += 1
+        elif source[idx] == "}":
+            depth -= 1
+        idx += 1
+    if depth:
+        raise CheckError(f"unterminated `{keyword} {name}` block in schema.graphql")
+    return source[start : idx - 1]
+
+
+def extract_graphql_events(source: str) -> dict[str, dict]:
+    """Extract `type <Event>Event` declarations from schema/schema.graphql.
+
+    Returns {event_name: {"topics": [...], "payload": [...]}} where the event
+    name is the snake_case form derived from the type name, matching the
+    convention used for the Rust `#[contractevent]` structs.
+    """
+    source = strip_comments(source)
+    events: dict[str, dict] = {}
+    for match in re.finditer(r"\btype\s+(\w+Event)\s*\{", source):
+        type_name = match.group(1)
+        body = _graphql_block(source, "type", type_name)
+        if body is None:
+            continue
+        topics: list[str] = []
+        payload: list[str] = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            field = re.match(r"(\w+)\s*:", stripped)
+            if not field:
+                continue
+            field_name = field.group(1)
+            if re.search(r"@topic\b", stripped):
+                topics.append(field_name)
+            else:
+                payload.append(field_name)
+        events[snake_case(type_name[: -len("Event")])] = {
+            "topics": topics,
+            "payload": payload,
+        }
+    return events
+
+
+def extract_sql_topic0(source: str) -> dict[str, str]:
+    """Extract `topic0` values keyed by event name from schema/schema.sql.
+
+    Recognises both a dedicated `topic0` column and inline `-- topic0: <hex>`
+    annotations, so the check works regardless of which layout the schema uses.
+    """
+    source = strip_comments(source)
+    topics: dict[str, str] = {}
+
+    # Inline annotation form: `-- topic0: 0x...` on the same line as a name.
+    for line in source.splitlines():
+        annotation = re.search(r"topic0\s*[:=]\s*(0x[0-9a-fA-F]+)", line)
+        if not annotation:
+            continue
+        name_match = re.search(r"['\"]?(\w+)['\"]?", line)
+        if name_match:
+            topics[snake_case(name_match.group(1))] = annotation.group(1).lower()
+
+    # Column form: `INSERT INTO ... (event_name, topic0) VALUES ('x', '0x...')`.
+    for match in re.finditer(
+        r"\(\s*'([^']+)'\s*,\s*'(0x[0-9a-fA-F]+)'\s*\)", source
+    ):
+        topics[snake_case(match.group(1))] = match.group(2).lower()
+
+    return topics
+
+
+def check_offchain_schema(
+    source_events: list[dict],
+    doc_rows: dict[str, dict],
+    graphql_events: dict[str, dict],
+    sql_topics: dict[str, str],
+) -> list[str]:
+    """Assert GraphQL and SQL schemas agree with the Rust/ABI event inventory."""
+    findings: list[str] = []
+    source_names = {e["name"] for e in source_events}
+
+    for event in source_events:
+        name = event["name"]
+
+        gql = graphql_events.get(name)
+        if gql is None:
+            findings.append(
+                f"event `{name}` exists in events.rs but has no `{name}` "
+                "GraphQL event type in schema/schema.graphql"
+            )
+        else:
+            if gql["topics"] != event["topics"]:
+                findings.append(
+                    f"event `{name}` GraphQL topic layout drifted.\n"
+                    f"    events.rs:            {event['topics']}\n"
+                    f"    schema.graphql:       {gql['topics']}"
+                )
+            if gql["payload"] != event["payload"]:
+                findings.append(
+                    f"event `{name}` GraphQL payload layout drifted.\n"
+                    f"    events.rs:            {event['payload']}\n"
+                    f"    schema.graphql:       {gql['payload']}"
+                )
+
+        if name not in sql_topics:
+            findings.append(
+                f"event `{name}` exists in events.rs but has no topic0 entry "
+                "in schema/schema.sql"
+            )
+
+    for name in graphql_events:
+        if name not in source_names:
+            findings.append(
+                f"schema/schema.graphql declares event `{name}`, which no "
+                "longer exists in events.rs"
+            )
+
+    for name in sql_topics:
+        if name not in source_names:
+            findings.append(
+                f"schema/schema.sql declares topic0 for event `{name}`, which "
+                "no longer exists in events.rs"
+            )
+
+    # The GraphQL and SQL inventories must agree with each other as well.
+    for name in graphql_events:
+        if name not in sql_topics:
+            findings.append(
+                f"event `{name}` is in schema.graphql but missing from "
+                "schema.sql topic0 values"
+            )
+    for name in sql_topics:
+        if name not in graphql_events:
+            findings.append(
+                f"event `{name}` is in schema.sql but missing from "
+                "schema.graphql event types"
+            )
+
+    return findings
+
+
 def run_checks() -> tuple[list[str], list[str]]:
     """Return (findings, structural_problems). Either non-empty means failure."""
     source_events = extract_events(_read(EVENTS_RS))
@@ -334,6 +492,13 @@ def run_checks() -> tuple[list[str], list[str]]:
     findings.extend(check_event_layout(source_events, doc_rows))
     findings.extend(check_constants(source_consts, _read(ABI_MD)))
     findings.extend(check_freeze_status(_read(ABI_MD)))
+
+    graphql_events = extract_graphql_events(_read(GRAPHQL_SCHEMA))
+    sql_topics = extract_sql_topic0(_read(SQL_SCHEMA))
+    findings.extend(
+        check_offchain_schema(source_events, doc_rows, graphql_events, sql_topics)
+    )
+
     return findings, table_problems
 
 

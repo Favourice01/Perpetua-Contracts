@@ -319,6 +319,181 @@ This Python snippet intentionally prints raw event metadata only. Decode the
 base64 XDR topics and value with a Stellar Python SDK or XDR implementation
 before interpreting stream IDs, addresses, statuses, or amounts.
 
+## Event reconstruction rules for the off-chain schema
+
+The GraphQL schema in [`schema/schema.graphql`](../schema/schema.graphql) is a
+thin, deterministic projection over the raw `events` table. Every GraphQL event
+type maps 1:1 to a row in `events`, and every `streams` field is derived by
+folding those rows forward. The rules below are the contract between the
+indexer and the schema; they must not drift from
+[ABI.md](ABI.md#topic-positions).
+
+### Raw `events` table row
+
+Each decoded Soroban event is persisted as exactly one row:
+
+| column | source | notes |
+|---|---|---|
+| `id` | indexer sequence | Monotonic surrogate key; ordering only. |
+| `contract_id` | `getEvents` filter | Always the Perpetua stream contract ID. |
+| `ledger` | `event.ledger` | Closed ledger sequence. |
+| `tx_hash` | `event.txHash` | Hex transaction hash. |
+| `tx_index` | `event.txIndex` | Transaction position within the ledger. |
+| `event_index` | `event.eventIndex` | Event position within the transaction. |
+| `topic0` | `event.topic[0]` | Decoded event name, e.g. `stream_created`. |
+| `stream_id` | `event.topic[1]` | Decoded `u64` stream ID; `NULL` only if the ABI ever drops it. |
+| `topics` | `event.topic[1..]` | Remaining decoded topics as JSONB, preserving order. |
+| `payload` | `event.value` | Decoded event body as JSONB, per the ABI payload layout. |
+| `raw_topics` | `event.topic` | Base64 XDR topics, retained for re-decoding. |
+| `raw_value` | `event.value` | Base64 XDR value, retained for re-decoding. |
+| `event_version` | decoder | ABI/decoder version used to produce `payload`. |
+
+`topic0` is the snake_case event name and is the discriminator the GraphQL
+resolvers switch on. `stream_id` is lifted out of `topic[1]` so that stream
+queries never have to scan JSONB topics. The remaining topics stay in `topics`
+in positional order because their arity varies from 2 to 4 (see the event model
+table above); consumers must read the topic count per event rather than assume
+a fixed width.
+
+### Folding events into the `streams` projection
+
+The `streams` projection is rebuilt by replaying `events` in
+`(ledger, tx_index, event_index)` order and applying each event to the stream
+identified by `stream_id`:
+
+1. `stream_created` bootstraps the row: it sets `sender`, `recipient`,
+   `token`, `deposit_amount`, `start_time`, `end_time`, `cliff_time`,
+   `status`, and the initial accounting fields from `payload`.
+2. `withdrawn` adds to `withdrawn_amount` and updates the cumulative
+   accounting fields from `payload`.
+3. `cancelled`, `paused`, `resumed`, and `topped_up` transition `status` and
+   adjust `deposit_amount`/`remaining_amount` as defined by the ABI payload.
+4. `recipient_transferred` updates `recipient`; `delegate_granted` and
+   `delegate_revoked` update the delegate set; `ttl_extended` updates
+   `last_extended_ledger` only.
+
+Folding is deterministic and order-sensitive: never apply events out of
+`(ledger, tx_index, event_index)` order, and never apply an event whose
+`stream_created` predecessor has not been seen. If a fold encounters an event
+for an unknown `stream_id`, stop and reconcile with `getLedgerEntries` rather
+than inventing a partial row.
+
+### Idempotent dedup key
+
+The dedup key is `(tx_hash, event_index)`. It is the only identity that is
+stable across re-org-free Soroban history and across RPC pagination retries.
+Enforce it with a database unique constraint:
+
+```sql
+CREATE UNIQUE INDEX events_dedup ON events (tx_hash, event_index);
+```
+
+Insert with `ON CONFLICT (tx_hash, event_index) DO NOTHING` so that a retried
+page, a restarted backfill, or an overlapping checkpoint window cannot create a
+duplicate event or double-apply a fold. `(contract_id, tx_hash, event_index)`
+is also unique and is the preferred key when a single database indexes more
+than one contract.
+
+### Detecting and recovering archived streams
+
+Soroban persistent entries can expire. A stream whose entry has been archived
+still has historical events in `events`, but its live storage is gone. Detect
+this condition before serving a stream:
+
+```text
+stream_exists == false && stream_id < stream_count()  ->  archived
+```
+
+When the condition holds, the stream is archived, not missing. Recover it by
+submitting a `RestoreFootprint` operation for the stream's persistent entry,
+then re-read the entry with `getLedgerEntries` and re-fold any events that
+landed while the entry was archived. Do not delete the projection row and do
+not treat the stream as cancelled; archival is a storage condition, not a
+contract state transition.
+
+Recovery is idempotent: `RestoreFootprint` is safe to retry, and re-folding
+events is safe because the dedup key prevents double application. If a restore
+times out, retry the same footprint before advancing the checkpoint.
+
+## Read-skew handling
+
+RPC reads can be served from different ledgers within a single logical
+operation, which produces torn views (for example, a `streams` row from ledger
+N and a `withdrawn_amount` from ledger N+1). Pin every multi-view read to one
+ledger:
+
+1. Resolve a single `latestLedger` for the operation.
+2. Pass that ledger to every `getLedgerEntries` call in the operation.
+3. Reject or retry any response whose `latestLedger` differs from the pinned
+   value.
+4. Only advance the indexer checkpoint after all reads for the operation agree
+   on the pinned ledger.
+
+The full failure taxonomy, retry policy, and provider-specific caveats are in
+[`docs/soroban-rpc-read-skew.md`](soroban-rpc-read-skew.md). Treat that document
+as the interface of record for skew handling.
+
+## Usage examples
+
+Query a stream projection and its recent events through GraphQL:
+
+```graphql
+query StreamWithEvents($id: ID!) {
+  stream(id: $id) {
+    id
+    sender
+    recipient
+    status
+    depositAmount
+    withdrawnAmount
+    events(orderBy: { ledger: ASC, txIndex: ASC, eventIndex: ASC }) {
+      topic0
+      streamId
+      payload
+      ledger
+      txHash
+      eventIndex
+    }
+  }
+}
+```
+
+Reconstruct the same projection directly from SQL:
+
+```sql
+SELECT
+  e.topic0,
+  e.stream_id,
+  e.payload,
+  e.ledger,
+  e.tx_hash,
+  e.event_index
+FROM events e
+WHERE e.stream_id = $1
+ORDER BY e.ledger, e.tx_index, e.event_index;
+```
+
+Insert a decoded event idempotently:
+
+```sql
+INSERT INTO events (
+  contract_id, ledger, tx_hash, tx_index, event_index,
+  topic0, stream_id, topics, payload, raw_topics, raw_value, event_version
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+ON CONFLICT (tx_hash, event_index) DO NOTHING;
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Resolution |
+|---|---|---|
+| A stream is missing from `streams` but its events exist | `stream_created` was never folded, or the fold stopped on an unknown `stream_id`. | Replay `events` for that `stream_id` in `(ledger, tx_index, event_index)` order. |
+| Duplicate events after a restart | The dedup key was not enforced, or the checkpoint overlapped without `ON CONFLICT`. | Add the `(tx_hash, event_index)` unique index and re-run the backfill. |
+| `stream_exists == false` for a stream below `stream_count()` | The persistent entry was archived. | Submit `RestoreFootprint`, re-read with `getLedgerEntries`, and re-fold. |
+| `withdrawn_amount` jumps backwards | A multi-view read was served from different ledgers. | Pin all reads in the operation to one `latestLedger` and retry on mismatch. |
+| `payload` fields decode to the wrong types | The decoder version does not match the ABI used at emit time. | Re-decode from `raw_topics`/`raw_value` with the correct `event_version`. |
+| Topic arity mismatch | The consumer assumed a fixed four-topic layout. | Read the topic count per event; arity ranges from 2 to 4. |
+
 ## Operational recommendations
 
 1. Backfill from a known ledger before the contract deployment ledger, then

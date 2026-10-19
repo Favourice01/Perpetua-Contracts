@@ -1,0 +1,23 @@
+{
+  "event": "stream_created",
+  "topics": [
+    "stream_created",
+    "stream_id"
+  ],
+  "data": {
+    "stream_id": "1",
+    "sender": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF5",
+    "recipient": "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "token": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    "amount": "1000000000",
+    "start_time": 1700000000,
+    "end_time": 1700086400,
+    "cliff_time": 1700003600,
+    "withdrawable": "0",
+    "withdrawn": "0",
+    "paused": false,
+    "delegate": null
+  },
+  "ledger_sequence": 1234567,
+  "stream_id": "1"
+}

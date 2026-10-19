@@ -95,6 +95,90 @@ class TestScriptIntegrity:
         script = REPO_ROOT / "script" / "check_snapshot_diff.py"
         assert script.exists(), "script/check_snapshot_diff.py missing"
 
+    def test_abi_drift_check_script(self):
+        script = REPO_ROOT / "script" / "abi-drift-check.py"
+        assert script.exists(), "script/abi-drift-check.py missing"
+        assert script.stat().st_size > 0, "script/abi-drift-check.py is empty"
+
+
+class TestOffChainSchema:
+    """Verify the off-chain subgraph & SQL indexer schema artifacts."""
+
+    def test_graphql_schema_exists_and_non_empty(self):
+        schema = REPO_ROOT / "schema" / "schema.graphql"
+        assert schema.exists(), "schema/schema.graphql missing"
+        assert schema.stat().st_size > 0, "schema/schema.graphql is empty"
+
+    def test_sql_schema_exists_and_non_empty(self):
+        schema = REPO_ROOT / "schema" / "schema.sql"
+        assert schema.exists(), "schema/schema.sql missing"
+        assert schema.stat().st_size > 0, "schema/schema.sql is empty"
+
+    def test_graphql_schema_has_entities(self):
+        schema = REPO_ROOT / "schema" / "schema.graphql"
+        content = schema.read_text()
+        assert "type " in content, "schema.graphql declares no GraphQL types"
+
+    def test_sql_schema_has_tables(self):
+        schema = REPO_ROOT / "schema" / "schema.sql"
+        content = schema.read_text().lower()
+        assert "create table" in content, "schema.sql declares no tables"
+
+    def test_validate_doc_alignment_covers_schema(self):
+        """validate-doc-alignment.py must verify schema docstrings/markdown refs."""
+        mod = _import_script("validate-doc-alignment.py")
+        assert mod is not None
+        assert hasattr(mod, "check_schema_alignment"), (
+            "validate-doc-alignment.py has no check_schema_alignment"
+        )
+        assert mod.check_schema_alignment() is True
+
+    def test_abi_drift_check_covers_offchain_schema(self):
+        """abi-drift-check.py must cover the off-chain schema artifacts."""
+        mod = _import_script("abi-drift-check.py")
+        assert mod is not None
+        assert hasattr(mod, "check_offchain_schema"), (
+            "abi-drift-check.py has no check_offchain_schema"
+        )
+        assert mod.check_offchain_schema() is True
+
+    def test_schema_version_marker_present(self):
+        """The schemaVersion/abiVersion marker must be present in the schema."""
+        schema = REPO_ROOT / "schema" / "schema.graphql"
+        content = schema.read_text()
+        assert "schemaVersion" in content or "abiVersion" in content, (
+            "schema.graphql missing schemaVersion/abiVersion marker"
+        )
+
+    def test_schema_version_marker_matches_abi_md(self):
+        """The schemaVersion/abiVersion marker must match docs/ABI.md."""
+        schema = REPO_ROOT / "schema" / "schema.graphql"
+        abi_md = REPO_ROOT / "docs" / "ABI.md"
+        assert abi_md.exists(), "docs/ABI.md missing"
+        schema_content = schema.read_text()
+        abi_content = abi_md.read_text()
+
+        import re
+
+        def _extract_version(text: str):
+            match = re.search(
+                r"(?:schemaVersion|abiVersion)\s*[:=]?\s*[\"']?([0-9]+\.[0-9]+\.[0-9]+)",
+                text,
+            )
+            return match.group(1) if match else None
+
+        schema_version = _extract_version(schema_content)
+        abi_version = _extract_version(abi_content)
+        assert schema_version is not None, (
+            "schema.graphql has no parseable schemaVersion/abiVersion value"
+        )
+        assert abi_version is not None, (
+            "docs/ABI.md has no parseable schemaVersion/abiVersion value"
+        )
+        assert schema_version == abi_version, (
+            f"schema version {schema_version} does not match docs/ABI.md {abi_version}"
+        )
+
 
 class TestSourceConsistency:
     """Quick structural checks on the Rust source."""

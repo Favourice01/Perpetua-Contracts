@@ -369,6 +369,77 @@ reconstruction rules an indexer must follow are documented in
 
 ---
 
+## Off-chain indexer schema parity contract
+
+The off-chain indexer schemas are **derived artifacts** of the frozen event
+table above, not independent interfaces:
+
+* [`schema/schema.graphql`](../schema/schema.graphql) — the subgraph schema
+  consumed by GraphQL clients and the SDK.
+* [`schema/schema.sql`](../schema/schema.sql) — the SQL indexer schema
+  consumed by `Perpetua-Backend`.
+
+Both mirror the `## Events` table **1:1**: every row in that table has exactly
+one GraphQL event type and exactly one SQL topic0 value, and vice versa. There
+are no indexer-only events and no ABI events without an indexer projection.
+
+### Event → GraphQL type → SQL topic0
+
+`topic0` is the snake_case event name, encoded as an `ScSymbol` and stored in
+the SQL indexer as the canonical routing key. The GraphQL type name is the
+PascalCase form of the same event.
+
+| ABI event | GraphQL event type | SQL `topic0` |
+|---|---|---|
+| `stream_created` | `StreamCreated` | `stream_created` |
+| `withdrawn` | `Withdrawn` | `withdrawn` |
+| `cancelled` | `Cancelled` | `cancelled` |
+| `paused` | `Paused` | `paused` |
+| `resumed` | `Resumed` | `resumed` |
+| `topped_up` | `ToppedUp` | `topped_up` |
+| `recipient_transferred` | `RecipientTransferred` | `recipient_transferred` |
+| `delegate_granted` | `DelegateGranted` | `delegate_granted` |
+| `delegate_revoked` | `DelegateRevoked` | `delegate_revoked` |
+| `ttl_extended` | `TtlExtended` | `ttl_extended` |
+
+Topic ordering, payload field order and payload field names in the GraphQL and
+SQL schemas are identical to the `## Events` table. A field that is a topic in
+the ABI is a topic in the indexer; a field that is in the payload is a payload
+column. The indexer does not reorder, rename or flatten either.
+
+### Version markers
+
+The schemas carry a version marker that must agree with this document:
+
+| marker | location | value |
+|---|---|---|
+| `schemaVersion` | `schema/schema.graphql`, `schema/schema.sql` | `1` |
+| `abiVersion` | `contracts/stream/src/lib.rs` (`ABI_VERSION`) | see the top of this file |
+
+`schemaVersion` is bumped only for a **breaking** indexer change (a renamed or
+removed type, field or topic0). Additive changes leave it untouched, exactly as
+`ABI_VERSION` is left untouched for additive ABI changes.
+
+### Enforcement
+
+Parity is mechanically enforced in CI, not by review alone:
+
+* [`script/abi-drift-check.py`](../script/abi-drift-check.py) — fails when the
+  `## Events` table, `events.rs`, and the GraphQL/SQL event sets disagree.
+* [`script/check_snapshot_diff.py`](../script/check_snapshot_diff.py) — fails
+  when the golden JSON snapshots under `tests/fixtures/event_snapshots/` no
+  longer match the schemas, catching silent field reordering or renaming.
+
+### Additive change rule
+
+Any additive change must **append trailing fields in both the Rust struct and
+the GraphQL/SQL schema in the same commit**. Appending on one side only is a
+parity break and fails CI. Never insert a field in the middle of a payload, and
+never reorder topics — both are breaking under the freeze rules above and
+require a new deployment plus a `schemaVersion` bump.
+
+---
+
 ## Resolved schema questions
 
 Both were open against `Perpetua-Backend` in [MIGRATION.md](MIGRATION.md) §5
