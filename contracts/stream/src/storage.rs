@@ -197,25 +197,99 @@ pub fn next_stream_id(env: &Env) -> u64 {
 /// Allocate the next stream id, guarding against `u64` overflow.
 ///
 /// The counter is read from instance storage, incremented with `checked_add`,
-/// and written back. If the counter is already at `u64::MAX` the increment
-/// would silently wrap to `0` and collide with live streams, so the overflow
-/// is surfaced as [`Error::StreamIdOverflow`] instead.
+/// and written back. The current value is the id returned to the caller, so
+/// the first id is zero and the counter remains the number of issued ids. If
+/// the counter is already at `u64::MAX`, it cannot be incremented without
+/// wrapping; creation fails with the existing [`Error::StreamIdExhausted`]
+/// ABI variant.
 ///
 /// The instance entry is re-extended to the network maximum on every
 /// allocation so the id counter can never archive before the streams it
 /// issued (see the module docs on the ordering guarantee).
 pub fn allocate_stream_id(env: &Env) -> Result<u64, Error> {
     let current = next_stream_id(env);
-    let next = current.checked_add(1).ok_or(Error::StreamIdOverflow)?;
+    let next = current.checked_add(1).ok_or(Error::StreamIdExhausted)?;
     env.storage().instance().set(&DataKey::NextStreamId, &next);
     extend_instance(env);
-    Ok(next)
+    Ok(current)
 }
 
 /// Bump the instance entry. Tiny, and it carries the id counter, so it is
 /// always extended to the network maximum.
 pub fn extend_instance(env: &Env) {
+    let max_ttl = env.storage().max_ttl();
+    env.storage().instance().extend_ttl(max_ttl, max_ttl);
+}
+
+/// Read a stream for a state-changing call and refresh its persistent TTL.
+pub fn load_stream(env: &Env, stream_id: u64) -> Result<Stream, Error> {
+    let key = DataKey::Stream(stream_id);
+    let stream = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::StreamNotFound)?;
+    extend_stream(env, stream_id, &stream);
+    Ok(stream)
+}
+
+/// Read a stream without changing its TTL. Used by views and batch preflight.
+pub fn peek_stream(env: &Env, stream_id: u64) -> Result<Stream, Error> {
     env.storage()
-        .instance()
-        .extend_ttl(env.storage().max_ttl(), env.storage().max_ttl());
+        .persistent()
+        .get(&DataKey::Stream(stream_id))
+        .ok_or(Error::StreamNotFound)
+}
+
+/// Persist stream state and fund its TTL for the current schedule horizon.
+pub fn save_stream(env: &Env, stream_id: u64, stream: &Stream) {
+    let key = DataKey::Stream(stream_id);
+    env.storage().persistent().set(&key, stream);
+    extend_stream(env, stream_id, stream);
+}
+
+/// Extend a stream entry to its schedule-aware TTL target.
+pub fn extend_stream(env: &Env, stream_id: u64, stream: &Stream) {
+    let target = ttl_target_ledgers(env, stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::Stream(stream_id), target, target);
+}
+
+/// Number of successfully allocated stream ids.
+pub fn stream_count(env: &Env) -> u64 {
+    next_stream_id(env)
+}
+
+/// Whether an entry for this stream id is currently present in persistent storage.
+pub fn stream_exists(env: &Env, stream_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::Stream(stream_id))
+}
+
+/// Persist a delegate grant and keep it alive for the maximum available TTL.
+pub fn save_delegate(env: &Env, stream_id: u64, delegate: &Address, grant: &DelegateGrant) {
+    let key = DataKey::Delegate(stream_id, delegate.clone());
+    env.storage().persistent().set(&key, grant);
+    let max_ttl = env.storage().max_ttl();
+    env.storage().persistent().extend_ttl(&key, max_ttl, max_ttl);
+}
+
+/// Load a delegate grant and renew its TTL while it is actively used.
+pub fn load_delegate(env: &Env, stream_id: u64, delegate: &Address) -> Option<DelegateGrant> {
+    let key = DataKey::Delegate(stream_id, delegate.clone());
+    let grant = env.storage().persistent().get(&key);
+    if grant.is_some() {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().persistent().extend_ttl(&key, max_ttl, max_ttl);
+    }
+    grant
+}
+
+/// Remove a delegate grant. Revocation is idempotent.
+pub fn remove_delegate(env: &Env, stream_id: u64, delegate: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Delegate(stream_id, delegate.clone()));
 }

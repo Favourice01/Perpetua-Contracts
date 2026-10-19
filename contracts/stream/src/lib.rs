@@ -287,7 +287,7 @@ impl FluxoraStream {
             .checked_mul(total_duration as i128)
             .ok_or(Error::Overflow)?;
 
-        let stream_id = storage::next_stream_id(&env)?;
+        let stream_id = storage::allocate_stream_id(&env)?;
         let stream = Stream {
             sender: sender.clone(),
             recipient,

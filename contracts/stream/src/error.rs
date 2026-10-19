@@ -33,12 +33,6 @@ pub enum Error {
     /// `deposited < duration`, so the per-second rate truncates to zero and the
     /// recipient would accrue nothing. See `MIN_RATE_STROOPS_PER_SECOND`.
     DepositRateTooLow = 5,
-    /// `deposited < (end_time - start_time)`, i.e. the deposit-to-duration
-    /// ratio is below the minimum of 1 stroop per second. The per-second rate
-    /// would truncate to zero under integer division, so the recipient would
-    /// accrue nothing until very late in the schedule. Deposit at least one
-    /// stroop per second of duration.
-    DepositTooSmall = 32,
     /// Sender and recipient are the same address.
     SelfStream = 6,
 
@@ -104,13 +98,6 @@ pub enum Error {
     /// wraps — this error is terminal for new-stream creation.
     StreamIdExhausted = 24,
 
-    /// The `next_stream_id` counter would overflow `u64` on increment. This is
-    /// the checked-increment guard for the stream counter: rather than silently
-    /// wrapping to 0 (which would reuse ids and corrupt lookups), the increment
-    /// fails with this typed error. Practically unreachable at 1.8e19 streams,
-    /// but enforced so wrapping can never occur.
-    StreamIdOverflow = 33,
-
     // --- Token sub-invocation ---
     /// The token contract rejected the transfer (e.g. insufficient balance in
     /// the pool on a payout, insufficient sender balance on a deposit, or the
@@ -153,14 +140,6 @@ pub enum Error {
     /// Zero or negative `top_up` amount.
     InvalidTopUp = 31,
 
-    // --- Batch resource limits ---
-    /// `batch_withdraw` received more than `MAX_BATCH_SIZE` (16) stream ids.
-    ///
-    /// The 16-stream ceiling is bounded by Soroban's contract event budget
-    /// (16,384 bytes): each withdrawal emits both a contract and a token
-    /// event (~512 bytes), so a larger batch would exceed event memory limits
-    /// on heavy token contracts. Chunk the ids client-side.
-    BatchSizeExceeded = 32,
 }
 
 impl Error {
