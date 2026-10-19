@@ -40,7 +40,10 @@ export type StreamErrorCode =
   | 28 // DelegateExpired
   | 29 // MalformedStreamId
   | 30 // RepeatedTransfer
-  | 31 // InvalidTopUp;
+  | 31 // InvalidTopUp
+  | 32 // DepositTooSmall
+  | 33 // StreamIdOverflow
+  | 34 // BatchSizeExceeded;
 
 /** Mapping from error discriminant to human-readable message. */
 const ERROR_MESSAGES: Record<number, string> = {
@@ -75,6 +78,9 @@ const ERROR_MESSAGES: Record<number, string> = {
   29: "MalformedStreamId: a batch element is not a valid stream id.",
   30: "RepeatedTransfer: transfer recipient is the same as the current recipient.",
   31: "InvalidTopUp: top_up amount must be a positive integer.",
+  32: "DepositTooSmall: deposit is smaller than the stream duration in seconds.",
+  33: "StreamIdOverflow: the next stream id would overflow u64.",
+  34: "BatchSizeExceeded: batch size exceeds the maximum allowed.",
 };
 
 /**

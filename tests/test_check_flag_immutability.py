@@ -63,7 +63,7 @@ impl FluxoraStream {
 GOOD_TYPES = """\
 pub struct Stream {
     /// Fixed at creation, never mutable. Packed capability bits.
-    pub flags: u8,
+    pub flags: u32,
 }
 """
 
@@ -176,7 +176,7 @@ def test_removing_immutable_doc_fails(patch_src_root: Path) -> None:
 def test_removing_a_field_declaration_fails(patch_src_root: Path) -> None:
     types = patch_src_root / "types.rs"
     content = types.read_text(encoding="utf-8")
-    types.write_text(content.replace("    pub flags: u8,\n", ""), encoding="utf-8")
+    types.write_text(content.replace("    pub flags: u32,\n", ""), encoding="utf-8")
     assert _run() == 1
 
 

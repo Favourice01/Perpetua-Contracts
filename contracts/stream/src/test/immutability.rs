@@ -134,7 +134,7 @@ fn capability_guards_are_the_only_flag_touches_outside_creation() {
 /// part of the source, not just the tests.
 #[test]
 fn flag_fields_are_declared_immutable_in_types() {
-    let decl = "pub flags: u8,";
+    let decl = "pub flags: u32,";
     let hits = flag_lines(TYPES_SRC, decl);
     assert_eq!(
         hits.len(),
@@ -153,6 +153,27 @@ fn flag_fields_are_declared_immutable_in_types() {
         "types.rs:{n}: packed flags are not documented as immutable: `{documentation}`"
     );
     assert_eq!(line.trim_start(), decl);
+}
+
+#[test]
+fn packed_flag_bits_round_trip_every_creation_combination() {
+    use crate::types::{flag, Stream};
+
+    for bits in 0..8 {
+        let cancellable = bits & 1 != 0;
+        let pausable = bits & 2 != 0;
+        let transferable = bits & 4 != 0;
+        let packed = Stream::flags_from_parts(cancellable, pausable, transferable);
+
+        assert_eq!(packed, bits);
+        assert_eq!(packed & flag::CANCELLABLE != 0, cancellable);
+        assert_eq!(packed & flag::PAUSABLE != 0, pausable);
+        assert_eq!(packed & flag::TRANSFERABLE != 0, transferable);
+    }
+
+    assert_eq!(flag::CANCELLABLE & flag::PAUSABLE, 0);
+    assert_eq!(flag::CANCELLABLE & flag::TRANSFERABLE, 0);
+    assert_eq!(flag::PAUSABLE & flag::TRANSFERABLE, 0);
 }
 
 // ---------------------------------------------------------------------------

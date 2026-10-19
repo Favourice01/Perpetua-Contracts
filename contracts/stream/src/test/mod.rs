@@ -45,6 +45,8 @@ mod storage_keys;
 mod terminal_operations;
 // Issue #14: SEP-41 non-standard return values and transfer failure rollbacks.
 mod token_errors;
+// Issue #1571: withdrawal and batch-withdraw accounting rollback on token failure.
+mod withdrawal_atomicity;
 mod top_up;
 mod transfer;
 

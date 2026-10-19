@@ -75,10 +75,10 @@ def check_file(path: Path, inits: dict[str, list[tuple[str, int]]]):
 
 
 def check_types(types_path: Path) -> list[str]:
-    """The packed field must be `pub flags: u8` with an immutable doc."""
+    """The packed field must be `pub flags: u32` with an immutable doc."""
     problems: list[str] = []
     lines = types_path.read_text(encoding="utf-8").splitlines()
-    decl = "pub flags: u8"
+    decl = "pub flags: u32"
     hits = [i for i, l in enumerate(lines) if decl in l]
     if len(hits) != 1:
         problems.append("types.rs: packed flags should be declared exactly once")

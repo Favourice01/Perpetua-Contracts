@@ -95,6 +95,7 @@ const DISCRIMINANT_FIXTURE: &[(&str, u32)] = &[
     ("RepeatedTransfer", 30),
     // --- Arithmetic (top-up) ---
     ("InvalidTopUp", 31),
+    // --- Additions after the frozen v1 ABI ---
     ("DepositTooSmall", 32),
     ("StreamIdOverflow", 33),
     ("BatchSizeExceeded", 34),

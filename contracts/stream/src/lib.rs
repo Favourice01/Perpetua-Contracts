@@ -114,7 +114,7 @@ pub const MAX_BATCH_SIZE: u32 = 16;
 ///
 /// The on-chain contract is immutable, so a bump is a *new deployment*, not an
 /// in-place upgrade. See `docs/ABI.md` and `test::abi`.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Call `token.transfer(from, to, amount)` and map any failure to a stable
 /// stream-level error.

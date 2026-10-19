@@ -699,6 +699,38 @@ fn frozen_v1() -> Inventory {
                 name: "TopUpTooSmall".into(),
                 discriminant: 23,
             },
+            ErrorCase {
+                name: "StreamIdExhausted".into(),
+                discriminant: 24,
+            },
+            ErrorCase {
+                name: "TokenTransferFailed".into(),
+                discriminant: 25,
+            },
+            ErrorCase {
+                name: "TokenMissing".into(),
+                discriminant: 26,
+            },
+            ErrorCase {
+                name: "DelegateNotPermitted".into(),
+                discriminant: 27,
+            },
+            ErrorCase {
+                name: "DelegateExpired".into(),
+                discriminant: 28,
+            },
+            ErrorCase {
+                name: "MalformedStreamId".into(),
+                discriminant: 29,
+            },
+            ErrorCase {
+                name: "RepeatedTransfer".into(),
+                discriminant: 30,
+            },
+            ErrorCase {
+                name: "InvalidTopUp".into(),
+                discriminant: 31,
+            },
         ],
         events,
     }
