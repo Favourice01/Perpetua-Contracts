@@ -11,10 +11,10 @@ use soroban_sdk::contracterror;
 /// variant; only append.
 ///
 /// ## Creation atomicity
-/// Stream creation is transactional: `next_stream_id` and `stream_count` are
-/// only mutated after all validation and the token transfer succeed. If any
-/// phase fails, no ID is consumed and no count is incremented; stream IDs are
-/// therefore contiguous with no gaps.
+/// Stream creation is transactional: the next-id counter, stream count, and
+/// stream entry are staged in the same invocation as the token transfer. If
+/// any phase fails, Soroban rolls back every staged write, so no ID is consumed
+/// and stream IDs remain contiguous with no gaps.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]

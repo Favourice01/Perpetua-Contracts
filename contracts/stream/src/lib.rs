@@ -297,9 +297,8 @@ impl FluxoraStream {
 
         // Pull the deposit before writing the stream entry. If the token
         // transfer fails (missing contract, authorization refused, insufficient
-        // balance) we return a typed error and leave no phantom entry in
-        // storage — the id counter has already advanced, so the id is
-        // consumed, but no stream with that id is observable to any caller.
+        // balance), the failed Soroban invocation rolls back the id allocation
+        // as well, leaving no phantom entry and no gap in the id sequence.
         //
         // The sender's auth on this invocation covers the nested token
         // transfer; no prior approval is needed.
@@ -928,6 +927,7 @@ impl FluxoraStream {
 
         let grant = DelegateGrant { ops, expires_at };
         storage::save_delegate(&env, stream_id, &delegate, &grant);
+        storage::extend_stream(&env, stream_id, &stream);
         Self::bump_instance_ttl(&env);
 
         events::delegate_granted(&env, stream_id, &grantor, &delegate, ops, expires_at);
@@ -962,6 +962,7 @@ impl FluxoraStream {
         grantor.require_auth_for_args((stream_id, delegate.clone()).into_val(&env));
 
         storage::remove_delegate(&env, stream_id, &delegate);
+        storage::extend_stream(&env, stream_id, &stream);
         Self::bump_instance_ttl(&env);
         events::delegate_revoked(&env, stream_id, &grantor, &delegate);
         Ok(())
