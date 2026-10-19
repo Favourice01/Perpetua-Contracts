@@ -260,6 +260,3 @@ def test_property_no_silent_wrapping_on_overflow():
         if wrapped <= 0:
             with pytest.raises(InvariantViolation):
                 validate_deposit_rate(wrapped)
-</｜｜DSML｜｜ parameter>
-</｜｜DSML｜｜ invoke>
-</｜｜DSML｜｜ calls>
