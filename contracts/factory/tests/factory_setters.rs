@@ -13,7 +13,7 @@ use fluxora_factory::{
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
-    Address, BytesN, Env, IntoVal,
+    Address, Bytes, BytesN, Env, IntoVal,
 };
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
@@ -44,6 +44,22 @@ fn test_stream_salt_changes_when_any_tuple_component_changes() {
     assert_ne!(base, derive_stream_salt(&env, &other_sender, 1, 1));
     assert_ne!(base, derive_stream_salt(&env, &sender, 2, 1));
     assert_ne!(base, derive_stream_salt(&env, &sender, 1, 2));
+}
+
+#[test]
+fn test_stream_salt_keeps_the_existing_preimage_encoding() {
+    let env = Env::default();
+    let sender = Address::generate(&env);
+    let nonce = 0x0102_0304_0506_0708;
+    let stream_id = 0x1112_1314_1516_1718;
+
+    let mut preimage = Bytes::from_slice(&env, b"perpetua-factory-stream-salt-v1");
+    preimage.append(&sender.to_xdr(&env));
+    preimage.append(&Bytes::from_slice(&env, &nonce.to_be_bytes()));
+    preimage.append(&Bytes::from_slice(&env, &stream_id.to_be_bytes()));
+    let expected = env.crypto().sha256(&preimage);
+
+    assert_eq!(derive_stream_salt(&env, &sender, nonce, stream_id), expected);
 }
 
 // ---------------------------------------------------------------------------

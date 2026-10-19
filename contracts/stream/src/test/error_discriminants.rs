@@ -95,13 +95,16 @@ const DISCRIMINANT_FIXTURE: &[(&str, u32)] = &[
     ("RepeatedTransfer", 30),
     // --- Arithmetic (top-up) ---
     ("InvalidTopUp", 31),
+    ("DepositTooSmall", 32),
+    ("StreamIdOverflow", 33),
+    ("BatchSizeExceeded", 34),
 ];
 
 /// The highest discriminant value in the fixture above.
 ///
 /// New variants must use `LAST_DISCRIMINANT + 1`. This constant is checked
 /// against the fixture length so a gap is caught immediately.
-const LAST_DISCRIMINANT: u32 = 31;
+const LAST_DISCRIMINANT: u32 = 34;
 
 /// Assert that the fixture has no gaps and ends at `LAST_DISCRIMINANT`.
 ///
@@ -171,6 +174,9 @@ fn discriminant_fixture_matches_source() {
         ("MalformedStreamId", Error::MalformedStreamId as u32),
         ("RepeatedTransfer", Error::RepeatedTransfer as u32),
         ("InvalidTopUp", Error::InvalidTopUp as u32),
+        ("DepositTooSmall", Error::DepositTooSmall as u32),
+        ("StreamIdOverflow", Error::StreamIdOverflow as u32),
+        ("BatchSizeExceeded", Error::BatchSizeExceeded as u32),
     ];
 
     assert_eq!(

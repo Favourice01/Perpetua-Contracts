@@ -33,8 +33,8 @@ use soroban_sdk::xdr::{
 };
 
 use crate::events::{
-    Cancelled, Paused, RecipientTransferred, Resumed, StreamCreated, ToppedUp, TtlExtended,
-    Withdrawn,
+    Cancelled, DelegateGranted, DelegateRevoked, Paused, RecipientTransferred, Resumed,
+    StreamCreated, ToppedUp, TtlExtended, Withdrawn,
 };
 use crate::{Error, FluxoraStream, Stream, StreamStatus, ABI_VERSION};
 
@@ -99,6 +99,7 @@ const AUTH: &[(&str, &str)] = &[
     ("resume", "sender"),
     ("withdraw", "recipient"),
     ("batch_withdraw", "recipient"),
+    ("batch_transfer_recipient", "sender"),
     ("transfer_recipient", "recipient"),
     ("grant_delegate", "grantor"),
     ("revoke_delegate", "grantor"),
@@ -278,6 +279,9 @@ fn current_inventory() -> Inventory {
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_top_up())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_withdraw())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_batch_withdraw())),
+        function_from_spec(parse_spec(
+            &FluxoraStream::spec_xdr_batch_transfer_recipient(),
+        )),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_cancel())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_pause())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_resume())),
@@ -315,6 +319,8 @@ fn current_inventory() -> Inventory {
         event_from_spec(parse_spec(&StreamCreated::spec_xdr())),
         event_from_spec(parse_spec(&Withdrawn::spec_xdr())),
         event_from_spec(parse_spec(&Cancelled::spec_xdr())),
+        event_from_spec(parse_spec(&DelegateGranted::spec_xdr())),
+        event_from_spec(parse_spec(&DelegateRevoked::spec_xdr())),
         event_from_spec(parse_spec(&Paused::spec_xdr())),
         event_from_spec(parse_spec(&Resumed::spec_xdr())),
         event_from_spec(parse_spec(&ToppedUp::spec_xdr())),

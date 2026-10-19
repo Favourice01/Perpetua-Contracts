@@ -9,7 +9,7 @@ integrators. Anything not described here is not part of the interface.
 | | |
 |---|---|
 | Protocol | 27 |
-| SDK | `soroban-sdk` 27.0.5 |
+| SDK | `soroban-sdk` 27.0.6 |
 | Testnet contract | `CBCGTSCJXBMPPPE4BPDIPYZXPE2J5TQEKD2KCS7VQF533NKKEYGUTHXW` |
 | Wasm hash | `d47c96a344a79c614ab0dcf0eac62cc9384f6dc7f1d45c3f5109fb09658b035e` |
 | Interface spec sha256 | `acdfd259c7f9a854d42c5da4cda43138fb71b757b604a21c6dac8a8a5a3a86d1` |
@@ -211,6 +211,9 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | | | | 29 | `MalformedStreamId` |
 | | | | 30 | `RepeatedTransfer` |
 | | | | 31 | `InvalidTopUp` |
+| | | | 32 | `DepositTooSmall` |
+| | | | 33 | `StreamIdOverflow` |
+| | | | 34 | `BatchSizeExceeded` |
 
 `TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Perpetua's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
@@ -239,6 +242,7 @@ equivalent.
 | `top_up(stream_id, amount)` | sender | — |
 | `withdraw(stream_id, amount: Option<i128>)` | recipient | `i128` paid |
 | `batch_withdraw(recipient, stream_ids: Vec<u64>)` | recipient | `i128` total |
+| `batch_transfer_recipient(stream_ids: Vec<u64>, new_recipient: Address)` | sender | `u32` transferred |
 | `cancel(stream_id)` | sender | — |
 | `pause(stream_id)` / `resume(stream_id)` | sender | — |
 | `transfer_recipient(stream_id, new_recipient)` | recipient | — |
@@ -287,6 +291,8 @@ reverse) fails CI.
 | `stream_created` | `stream_id`, `sender`, `recipient` | `token`, `deposited`, `start_time`, `end_time`, `cliff_time`, `cancellable`, `pausable`, `transferable` |
 | `withdrawn` | `stream_id`, `recipient` | `amount`, `withdrawn`, `deposited`, `status` |
 | `cancelled` | `stream_id`, `sender`, `recipient` | `refunded`, `vested`, `withdrawn`, `end_time` |
+| `delegate_granted` | `stream_id`, `grantor`, `delegate` | `ops`, `expires_at` |
+| `delegate_revoked` | `stream_id`, `grantor`, `delegate` | — |
 | `paused` | `stream_id`, `sender` | `paused_at`, `paused_total` |
 | `resumed` | `stream_id`, `sender` | `paused_duration`, `paused_total` |
 | `topped_up` | `stream_id`, `sender` | `amount`, `deposited`, `end_time` |
@@ -329,24 +335,26 @@ the encoded size of each event, computed by
 
 Every figure is a multiple of 4, as XDR requires.
 
-**These are analytical, not measured.** They model the published encoding and
-do not include any per-event accounting the host adds outside the
-`ContractEvent` struct. Confirm against a host run before making a release
-decision on them.
+**These are analytical, not measured.** They model the published stream-event
+encoding and do not include the token contract's transfer events or per-event
+accounting the host adds outside the `ContractEvent` struct. The resource suite
+measures the complete transaction event total with the Stellar Asset Contract.
 
 #### Where the budget actually goes
 
-`batch_withdraw` emits one `withdrawn` event **per stream drawn from**, so the
-realistic worst case for one call is:
+`batch_withdraw` emits one `withdrawn` event and one token `transfer` event
+**per stream drawn from**. The stream event is 260 bytes; the SAC transfer event
+adds roughly another 252 bytes. At the 16-stream cap, the measured event total
+is about:
 
 ```text
-MAX_BATCH_SIZE (16) x withdrawn (260) = 4,160 bytes   =  25.4% of 16,384
+MAX_BATCH_SIZE (16) x (260 + ~252) = ~8,192 bytes   =  50% of 16,384
 ```
 
-That leaves **12,224 bytes of headroom**, about 75% of the budget unused. Even
-the largest event, `stream_created` at 428 bytes, would take 38 of them to
-approach the ceiling. **Event size is not a constraint on this contract**, and
-`MAX_BATCH_SIZE` is nowhere near the point where it becomes one.
+That leaves roughly **8,192 bytes of headroom** with the SAC. The event budget
+is the tightest measured resource at the cap, which is why the cap keeps a 2x
+margin. A custom token may emit a larger transfer event, so the exact maximum
+batch size is token-dependent.
 
 #### On the "< 256 bytes" target
 
@@ -367,9 +375,9 @@ No optimisation is warranted, for three reasons:
    SDK and indexer. Trading that for 4 bytes against a limit that is 75%
    unused is a bad trade.
 3. **The real headroom is in the batch path, not the event.** If event bytes
-   ever became a problem, the lever is `MAX_BATCH_SIZE`, not the shape of a
-   single event. At 16 it consumes a quarter of the budget; the ceiling would
-   not be reached until roughly 63 streams in one call.
+   become a problem for a token with a large transfer payload, the lever is
+   `MAX_BATCH_SIZE`, not the shape of a single stream event. With the SAC, the
+   current cap uses about half the transaction event budget.
 
 `tests/test_event_byte_budget.py` pins these figures, and pins the fact that
 `withdrawn` is *over* the 256 target, so that any future change to the

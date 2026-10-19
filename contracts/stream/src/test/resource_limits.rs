@@ -28,18 +28,21 @@
 //!
 //! # What each measurement covers
 //!
-//! Every invocation here reports and then bounds four resource dimensions:
+//! Every invocation reports the four enforced transaction dimensions and the
+//! host's measured linear-memory allocations:
 //!
 //! * **CPU** — `instructions`, the modelled CPU instruction count.
 //! * **Disk reads** — `disk_read_entries`, entries restored from disk. Live
 //!   contract state must keep this at zero under Protocol 27.
-//! * **Memory** — `memory_read_entries`, the in-memory ledger entries accessed
-//!   (live Soroban state is held in memory, not re-read from disk).
+//! * **Memory reads** — `memory_read_entries`, the in-memory ledger entries
+//!   accessed (live Soroban state is held in memory, not re-read from disk).
+//! * **Linear-memory allocation** — `mem_bytes`, recorded and checked for
+//!   linear scaling across batch sizes.
 //! * **Storage writes** — `write_entries`, the entries written to the ledger.
 //!
-//! The deterministic max/max+1 boundary tests below assert *all four* at the
-//! cap, and that one past the cap is rejected with [`Error::BatchTooLarge`]
-//! before any partial mutation.
+//! The deterministic max/max+1 boundary tests below assert all four enforced
+//! transaction dimensions at the cap and that one past the cap is rejected
+//! with [`Error::BatchTooLarge`] before any partial mutation.
 //!
 //! # Caveats on the numbers
 //!
@@ -86,6 +89,7 @@ struct Cost {
     disk_reads: u32,
     writes: u32,
     memory: u32,
+    memory_bytes: i64,
     instructions: i64,
     event_bytes: u32,
 }
@@ -102,17 +106,19 @@ fn report(h: &Harness, label: &str) -> Cost {
         disk_reads: r.disk_read_entries,
         writes: r.write_entries,
         memory: r.memory_read_entries,
+        memory_bytes: r.mem_bytes,
         instructions: r.instructions,
         event_bytes: r.contract_events_size_bytes,
     };
     std::println!(
         "{label:<26} footprint={:<4}/{LEDGER_ENTRY_LIMIT}  disk={:<4}/{DISK_READ_ENTRY_LIMIT}  \
-         writes={:<4}/{WRITE_ENTRY_LIMIT}  mem={:<4}  events={:<6}/{EVENT_BYTES_LIMIT}  \
-         instructions={}",
+         writes={:<4}/{WRITE_ENTRY_LIMIT}  mem={:<4}  mem_bytes={:<8}  \
+         events={:<6}/{EVENT_BYTES_LIMIT}  instructions={}",
         cost.footprint,
         cost.disk_reads,
         cost.writes,
         cost.memory,
+        cost.memory_bytes,
         cost.event_bytes,
         cost.instructions,
     );
@@ -133,6 +139,18 @@ fn assert_has_headroom(label: &str, cost: Cost, factor: u32) {
         "{label}: footprint {} lacks {factor}x headroom under {LEDGER_ENTRY_LIMIT}",
         cost.footprint,
     );
+        assert!(
+            cost.memory_bytes <= base.memory_bytes * size as i64,
+            "linear-memory allocation grew faster than linearly: {size} items took {} bytes vs {} for one",
+            cost.memory_bytes,
+            base.memory_bytes,
+        );
+        assert!(
+            cost.memory_bytes <= base.memory_bytes * size as i64,
+            "linear-memory allocation grew faster than linearly: {size} items took {} bytes vs {} for one",
+            cost.memory_bytes,
+            base.memory_bytes,
+        );
     assert_no_disk_reads(label, cost);
     assert!(
         cost.writes * factor <= WRITE_ENTRY_LIMIT,

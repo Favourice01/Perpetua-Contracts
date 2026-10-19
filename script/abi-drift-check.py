@@ -191,7 +191,8 @@ def parse_abi_event_table(document: str) -> tuple[dict[str, dict], list[str]]:
     start = document.find("\n## Events")
     if start == -1:
         raise CheckError("docs/ABI.md has no `## Events` section")
-    end = document.find("\n## ", start + 1)
+    next_heading = re.search(r"\n#{1,6}\s+", document[start + 1 :])
+    end = start + 1 + next_heading.start() if next_heading else -1
     section = document[start : end if end != -1 else len(document)]
 
     in_table = False

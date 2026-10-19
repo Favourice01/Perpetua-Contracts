@@ -140,6 +140,17 @@ pub enum Error {
     /// Zero or negative `top_up` amount.
     InvalidTopUp = 31,
 
+    // --- Additive discriminants ---
+    /// Reserved validation error for deposits below one stroop per second.
+    DepositTooSmall = 32,
+    /// The `next_stream_id` counter would overflow `u64` on increment. This
+    /// prevents wrapping to 0 and reusing an existing stream id.
+    StreamIdOverflow = 33,
+
+    // --- Batch resource limits ---
+    /// Reserved compatibility error; current batch entrypoints use
+    /// [`Self::BatchTooLarge`].
+    BatchSizeExceeded = 34,
 }
 
 impl Error {
