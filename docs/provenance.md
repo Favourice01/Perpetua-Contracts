@@ -146,13 +146,18 @@ holds:
 1. **Integrity** — a recorded artifact is missing from the release dir, or its
    bytes hash to something other than the recorded digest.
 2. **Completeness** — a `*.wasm` in the release dir is not listed in the
-   manifest. "Provenance for every contract" is enforced both directions, so a
-   newly added contract can never slip out unprovenanced.
+  manifest, a subject is listed more than once, or the release dir contains
+  no wasm artifacts. "Provenance for every contract" is enforced both
+  directions, so a newly added contract can never slip out unprovenanced and
+  an empty manifest cannot report a successful zero-artifact release.
 3. **Environment consistency** — the recorded `target`, `git_revision`,
    `rustc`, `cargo`, `soroban_sdk`, `toolchain_channel` or `profile` no longer
    match the current checkout and toolchain. This catches a manifest that was
    generated from a different commit or with different build inputs than the
    one being released.
+4. **Manifest identity** — `schema` and `build.build_type` must match the
+  identifiers supported by this verifier; an unknown manifest format is not
+  accepted as a valid attestation.
 
 Warnings only (never blocking): `git_ref` drift (the revision stays pinned),
 and a recorded dirty working tree. `host` and `started_on` are informational.
@@ -179,9 +184,9 @@ Explicit contract, so the gate is predictable:
 - **Failure** — every failure mode is a typed error with a specific message
   and a non-zero exit: missing release dir, dir is not a directory, no `*.wasm`
   found, workspace root not found, unparseable manifest, missing/unlisted
-  artifact, hash mismatch (both hashes reported), metadata drift (field and
-  both values reported), git/toolchain invocation failure. `verify` never
-  writes anything.
+  artifact, duplicate subject, unsupported schema/build type, hash mismatch
+  (both hashes reported), metadata drift (field and both values reported),
+  git/toolchain invocation failure. `verify` never writes anything.
 - **Boundaries** — an empty release dir is an error (`no *.wasm artifacts`),
   not a silently-empty manifest; a release gate that covers nothing is worse
   than one that fails. Artifacts are sorted by name so the manifest is
@@ -197,6 +202,14 @@ Explicit contract, so the gate is predictable:
   `verify`. Anyone who can run the release pipeline can bypass it only by
   deliberately not running it — which is why the gate lives in CI, not in
   documentation.
+
+## Scope boundary
+
+`tools/provenance` reads local release files and build metadata only. It does
+not read or mutate Soroban contract storage, make RPC calls, submit
+transactions, or control transaction retries. Persistent-entry archival and
+RPC ledger consistency must be handled by contract storage paths and their
+clients; they cannot be repaired in this build-time verifier.
 
 ## Reproducibility
 
