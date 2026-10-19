@@ -64,7 +64,6 @@ source have drifted apart. Update the model's expectations in the same change
 that moves the source.
 
 ## What this is, and what it is not
-=======
 
 Issue #54 asks for **measured CPU instruction counts**. This document does
 **not** contain them, and does not estimate them.

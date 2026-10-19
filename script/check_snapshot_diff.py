@@ -46,45 +46,6 @@ REQUIRED_PAYLOAD_FIELDS = {
 }
 
 EVENT_SNAPSHOT_DIR = REPO_ROOT / "tests" / "fixtures" / "event_snapshots"
-=======
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-# Security-relevant fields in snapshot JSON files
-SECURITY_FIELDS = {
-    "auth", "auths", "require_auth", "signatures", "events", "topic",
-    "topics", "data", "error", "error_code", "ContractError", "storage",
-    "state", "DataKey",
-}
-
-# Frozen event-name set from docs/ABI.md (issue #286).
-FROZEN_EVENT_NAMES = {
-    "stream_created",
-    "withdrawn",
-    "cancelled",
-    "paused",
-    "resumed",
-    "topped_up",
-    "recipient_transferred",
-    "delegate_granted",
-    "delegate_revoked",
-    "ttl_extended",
-}
-
-# Required payload fields per frozen event name.
-REQUIRED_PAYLOAD_FIELDS = {
-    "stream_created": {"stream_id", "sender", "recipient", "amount"},
-    "withdrawn": {"stream_id", "recipient", "amount"},
-    "cancelled": {"stream_id", "sender", "recipient"},
-    "paused": {"stream_id"},
-    "resumed": {"stream_id"},
-    "topped_up": {"stream_id", "amount"},
-    "recipient_transferred": {"stream_id", "old_recipient", "new_recipient"},
-    "delegate_granted": {"stream_id", "delegate"},
-    "delegate_revoked": {"stream_id", "delegate"},
-    "ttl_extended": {"stream_id", "extended_to"},
-}
-
-EVENT_SNAPSHOT_DIR = REPO_ROOT / "tests" / "fixtures" / "event_snapshots"
 
 
 def get_changed_files(base: str, head: str | None = None) -> list[str]:
