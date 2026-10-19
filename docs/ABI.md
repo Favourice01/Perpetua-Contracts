@@ -117,6 +117,61 @@ decimals** — not 6, not 18. Amounts cross the JSON-RPC boundary as *strings*
 (`"600000000"`), not numbers; a client that parses them as IEEE doubles will
 silently lose precision above 2^53.
 
+#### Enforced invariants
+
+The contract rejects degenerate parameters *before* any state is committed or
+any Soroban event is emitted, so an invalid stream can never be observed by an
+indexer. These invariants are pinned by regression tests in
+`contracts/stream/src/test.rs` and mirrored by the off-chain projections in
+[`schema/schema.graphql`](../schema/schema.graphql) and
+[`schema/schema.sql`](../schema/schema.sql); the SQL schema's `CHECK`
+constraints restate the same predicates so a projection cannot drift from the
+chain.
+
+**Time range.** `start_time < end_time` is required. A zero-duration schedule
+(`start_time == end_time`) is rejected with `InvalidTimeRange` (2) — the
+per-second rate would be a division by zero, so there is no valid interpretation
+of such a stream. `end_time` must also be strictly in the future at creation.
+
+**Cliff.** `start_time <= cliff_time <= end_time` is required. A cliff equal to
+`start_time` is the canonical "no cliff" encoding and is accepted. A cliff
+outside the range — including a zero-duration cliff window that would place
+`cliff_time` before `start_time` — is rejected with `InvalidCliff` (3). The
+cliff gates payout only; it never shifts the accrual origin (see
+[Cliff Vesting Semantics](#cliff-vesting-semantics-vs-delayed-start-schedules)).
+
+**Amount domain.** Every amount is a non-negative `i128` and every arithmetic
+step is checked, never wrapping:
+
+* `deposit <= 0` is rejected with `InvalidDeposit` (4).
+* A deposit so small that the derived per-second rate truncates to zero is
+  rejected with `DepositRateTooLow` (5) — a stream that accrues nothing is not a
+  stream. This is the guard that rejects a `1`-unit deposit against a long
+  schedule.
+* Any addition or multiplication that would exceed `i128::MAX` — a deposit at
+  or near `i128::MAX`, or a `top_up` that pushes `deposited` past it — is
+  rejected with `Overflow` (22). There is no silent wrapping and no saturating
+  fallback: the call fails and no state changes.
+* `top_up` amounts below the minimum that preserves the rate are rejected with
+  `TopUpTooSmall` (23) / `InvalidTopUp` (31).
+
+**Status transitions.** `status` moves only along the edges below; every other
+transition is rejected with `StreamNotActive` (11), `StreamNotPaused` (12) or
+`StreamAlreadyPaused` (13) as appropriate.
+
+| from | to | trigger |
+|---|---|---|
+| `Active` | `Paused` | `pause` |
+| `Paused` | `Active` | `resume` |
+| `Active` / `Paused` | `Cancelled` | `cancel` |
+| `Active` / `Paused` | `Depleted` | `withdraw` draining the stream to term |
+
+`Cancelled` and `Depleted` are **terminal and sticky**: once a stream reaches
+either, no further transition is possible. In particular a `Cancelled` stream
+that is later drained to zero stays `Cancelled` and never becomes `Depleted` —
+the two terminal states answer different questions and must not be collapsed
+(see [Resolved schema questions](#1-streamsstatus--mirror-the-contracts-four-values-verbatim)).
+
 ### `StreamStatus`
 
 Crosses the ABI as its **discriminant**, not its name.
