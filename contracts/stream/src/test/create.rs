@@ -442,6 +442,36 @@ fn rejects_deposit_that_would_overflow_accrual() {
 }
 
 #[test]
+fn maximum_deposit_overflow_is_rejected_before_state_or_funds_move() {
+    let h = Harness::new();
+    let start = h.now();
+    let sender_before = h.balance(&h.sender);
+
+    let err = h
+        .client
+        .try_create_stream(
+            &h.sender,
+            &h.recipient,
+            &h.token,
+            &i128::MAX,
+            &start,
+            &(start + 2),
+            &start,
+            &true,
+            &true,
+            &true,
+        )
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(err, Error::Overflow);
+    assert_eq!(h.client.stream_count(), 0);
+    assert_eq!(h.balance(&h.sender), sender_before);
+    assert_eq!(h.pool(), 0);
+    assert!(!h.client.stream_exists(&0));
+}
+
+#[test]
 fn backdated_start_vests_immediately() {
     let h = Harness::new();
     let start = h.now() - 50 * DAY;

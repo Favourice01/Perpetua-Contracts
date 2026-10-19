@@ -1087,6 +1087,30 @@ targets = ["wasm32v1-none"]
     }
 
     #[test]
+    fn verify_rejects_manifest_schema_or_build_type_drift() {
+        for field in ["schema", "build_type"] {
+            let s = scratch_repo();
+            write_wasm(&s.release, "fluxora_stream.wasm", &sample_wasm());
+            generate(&s.release, None, None, DEFAULT_TARGET).unwrap();
+
+            let path = s.release.join(MANIFEST_FILENAME);
+            let mut manifest: Manifest =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            if field == "schema" {
+                manifest.schema = "https://example.invalid/unknown-schema".to_string();
+            } else {
+                manifest.build.build_type = "https://example.invalid/unknown-build".to_string();
+            }
+            fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+            assert!(matches!(
+                verify(&s.release, None, None, DEFAULT_TARGET),
+                Err(Error::MetadataMismatch { field: actual, .. }) if actual == field
+            ));
+        }
+    }
+
+    #[test]
     fn verify_rejects_release_profile_drift() {
         let s = scratch_repo();
         write_wasm(&s.release, "fluxora_stream.wasm", &sample_wasm());

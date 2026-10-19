@@ -93,8 +93,10 @@ Two things are therefore running in parallel.
 **1. Testnet canary — clock started 2026-08-12.** `contracts/archival-probe` is a
 throwaway contract that writes one persistent entry and *deliberately never
 extends its TTL*, so it receives exactly `min_persistent_ttl` and archives as
-early as the network allows. The restore mechanism is a property of the ledger,
-not of the contract, so proving it there proves it for `DataKey::Stream(id)`.
+early as the network allows. Planting is first-write-wins: retrying an
+ambiguous plant transaction neither replaces the note nor restarts its TTL.
+The restore mechanism is a property of the ledger, not of the contract, so
+proving it there proves it for `DataKey::Stream(id)`.
 
 | | |
 |---|---|
