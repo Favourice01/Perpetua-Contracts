@@ -393,6 +393,171 @@ A single node you control cannot skew against itself. For an indexer or a keeper
 this is worth the operational cost; the barrier pattern above is a mitigation,
 not a guarantee.
 
+## Operator runbook: archived entries, footprint restoration, and retries
+
+This section is the operational companion to the pattern above. It covers the
+failure modes that show up once a streaming or vesting contract has been live
+long enough for its persistent entries to expire, and it is the procedure
+operators should follow when `script/event-byte-budget.py` (the Soroban 16 KiB
+Event Byte Footprint Enforcer) reports a footprint problem or a read-skew
+abort.
+
+### Detecting an archived persistent entry
+
+Soroban persistent entries have a TTL. When that TTL lapses the entry is
+*archived*: it is not deleted, but it is no longer readable by ordinary
+contract calls until it is restored. From the client side the symptom is
+subtle, because an archived entry does not produce a distinct RPC error — a
+view call that reads it simply behaves as though the entry were absent.
+
+The reliable detector is to compare the stream id against the stream count
+returned by the same snapshot:
+
+```
+stream_exists(id) == false   AND   id < stream_count()
+```
+
+Both halves matter:
+
+- `stream_exists(id) == false` alone is ambiguous. It is also what you get for
+  an id that was never allocated, or for a read that landed on a replica that
+  is behind the ledger that created the stream.
+- `id < stream_count()` proves the id *was* allocated. The count is monotonic
+  and is itself a persistent entry, so if the count says the stream exists but
+  the record does not, the record has been archived (or the read is skewed —
+  see the next subsection).
+
+`script/event-byte-budget.py` applies exactly this test. When it sees
+`stream_exists() == false` for an id below `stream_count()`, it does **not**
+treat the stream as absent and does **not** silently shrink the footprint it
+is about to report. It raises a distinct, non-retryable `ArchivedEntryError`
+naming the stream id, so the operator sees the archival rather than a
+plausible-but-wrong byte budget.
+
+### Distinguishing archival from ledger skew
+
+Archival and read skew produce the same `stream_exists() == false` symptom, and
+the recovery is different, so the enforcer distinguishes them before acting.
+Every RPC response carries `latestLedger`; `script/event-byte-budget.py` reads
+it from each response in a snapshot and compares the values:
+
+- **All responses agree on `latestLedger`, and the id is below the count.**
+  This is archival. Proceed to footprint restoration below.
+- **Responses disagree on `latestLedger`.** This is read skew, not archival.
+  The enforcer discards the snapshot and retries the whole group (see
+  "Idempotent retry semantics"). It never restores a footprint on the basis of
+  a skewed read, because a skewed read can make a live entry look archived.
+- **Responses agree, but the id is at or above the count.** The id was never
+  allocated. This is a caller error, not a recovery scenario.
+
+The enforcer also refuses to act on a snapshot whose `latestLedger` is behind
+the ledger it observed at the start of the run, which is the same
+"went backwards" condition described in *The observation, and its limits*
+above. A backwards `latestLedger` is treated as skew and retried, never as
+evidence of archival.
+
+### Restoring an archived footprint
+
+Restoration is a two-step operation and must be done in this order:
+
+1. **Build the restore transaction.** `RestoreFootprint` takes the ledger keys
+   of the archived entries, not the entries themselves. Use
+   `tools/sdk/restore_footprint.ts` to construct it:
+
+   ```bash
+   npx ts-node tools/sdk/restore_footprint.ts \
+     --contract "$STREAM_CONTRACT_ID" \
+     --stream-id "$STREAM_ID" \
+     --network testnet
+   ```
+
+   The tool reads `stream_count()` and the stream record, derives the exact
+   `LedgerKey` values for the archived entries, and prints the unsigned
+   `RestoreFootprint` operation. It does not submit anything.
+
+2. **Submit and confirm.** Sign and submit the transaction, then wait for it
+   to reach `SUCCESS` using the `waitForCommit` barrier above. Do not proceed
+   on `PENDING` or `NOT_FOUND` — those mean the RPC indexer has not caught up,
+   not that the restore failed.
+
+   ```bash
+   stellar tx submit --network testnet --sign-with "$SIGNER" restore.xdr
+   ```
+
+3. **Re-run the enforcer.** Only after the restore is confirmed:
+
+   ```bash
+   python3 script/event-byte-budget.py --contract "$STREAM_CONTRACT_ID"
+   ```
+
+   A successful restore makes the previously archived entry readable again,
+   and the enforcer's footprint report will include it. If the enforcer still
+   reports `ArchivedEntryError` for the same id, the restore did not cover the
+   entry — re-derive the ledger keys with `tools/sdk/restore_footprint.ts`
+   rather than guessing at them.
+
+Restoration is safe to repeat. `RestoreFootprint` on an entry that is already
+live is a no-op, so a restore that was submitted but whose confirmation you
+never observed can simply be re-submitted.
+
+### Idempotent retry semantics
+
+A failed or timed-out invocation of the enforcer must be safe to re-run, and
+the recovery paths are designed so that it is:
+
+- **The enforcer never mutates contract state.** It reads, computes a byte
+  footprint, and reports. Re-running it after any failure is always safe.
+- **Restoration is idempotent.** As above, restoring an already-live entry is a
+  no-op, so a restore whose confirmation was lost can be re-submitted without
+  checking first.
+- **Retries are bounded and jittered.** The enforcer retries a skewed snapshot
+  a fixed number of times with backoff, then exits non-zero with a
+  `ReadSkewError` rather than looping forever. A non-zero exit means "retry the
+  whole invocation", not "the contract is broken".
+- **A timed-out invocation leaves no partial state.** Because the enforcer
+  writes nothing, a timeout mid-run is indistinguishable from a run that never
+  started. Re-run it.
+
+The one thing that is *not* idempotent is submitting a `RestoreFootprint`
+transaction without confirming it. Always confirm before re-deriving keys, so
+that you are reacting to the chain's state and not to your own unconfirmed
+submission.
+
+### Usage examples
+
+Check the footprint of a single stream:
+
+```bash
+python3 script/event-byte-budget.py --contract "$STREAM_CONTRACT_ID" --stream-id 42
+```
+
+Check every stream in the contract, with the read-skew barrier enabled:
+
+```bash
+python3 script/event-byte-budget.py --contract "$STREAM_CONTRACT_ID" --all --pin-ledger
+```
+
+Emit machine-readable output for a monitoring pipeline:
+
+```bash
+python3 script/event-byte-budget.py --contract "$STREAM_CONTRACT_ID" --all --json
+```
+
+### Troubleshooting
+
+| symptom | likely cause | action |
+|---|---|---|
+| `ArchivedEntryError` for a stream id below `stream_count()` | persistent entry TTL lapsed | restore with `tools/sdk/restore_footprint.ts`, confirm, re-run |
+| `ReadSkewError` after the retry budget | RPC replicas disagreeing on `latestLedger` | re-run; if it persists, point at a single node you control |
+| `latestLedger` went backwards mid-run | backend catching up after a restart | treated as skew and retried automatically; no action unless it persists |
+| footprint report omits a stream you know exists | the stream is archived, or the read was skewed | check for `ArchivedEntryError`; if absent, re-run with `--pin-ledger` |
+| invocation timed out | RPC latency, not contract state | re-run; the enforcer writes nothing |
+| `RestoreFootprint` submitted but never confirmed | RPC indexer lag | re-submit; restoration is idempotent |
+
+See `docs/KNOWN-LIMITATIONS.md` §1 for the underlying constraint on persistent
+entry lifetime and why archival is expected rather than exceptional for
+long-lived streams.
+
 ## What this is not
 
 **Not a consensus or data-integrity problem.** Any node serving an older ledger

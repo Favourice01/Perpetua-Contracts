@@ -66,6 +66,19 @@ const WRITE_ENTRY_LIMIT: u32 = 200;
 const EVENT_BYTES_LIMIT: u32 = 16_384;
 /// Maximum modelled CPU instructions per invocation.
 const INSTRUCTION_LIMIT: i64 = 400_000_000;
+/// Documented ceiling on modelled CPU instructions for the `batch_extend_ttl`
+/// path at [`MAX_BATCH_SIZE`]. Kept well under [`INSTRUCTION_LIMIT`] so a
+/// regression in the hot loop trips this assertion long before the protocol
+/// limit is reached.
+const BATCH_EXTEND_TTL_INSTRUCTION_CEILING: i64 = 40_000_000;
+/// Documented ceiling on in-memory ledger entry reads for the
+/// `batch_extend_ttl` path at [`MAX_BATCH_SIZE`]. One entry per stream plus a
+/// small fixed overhead; a super-linear scan would blow straight through it.
+const BATCH_EXTEND_TTL_MEMORY_CEILING: u32 = MAX_BATCH_SIZE + 8;
+/// Slack allowed when checking that per-item cost is flat: a batch of `n`
+/// items may cost at most `n` times the single-item cost plus this constant,
+/// absorbing fixed per-invocation overhead without masking super-linear growth.
+const PER_ITEM_FLATNESS_SLACK: i64 = 4_000_000;
 
 #[derive(Debug, Clone, Copy)]
 struct Cost {
@@ -422,6 +435,81 @@ fn batch_extend_ttl_at_max_succeeds_and_records_costs() {
     let cost = report(&h, "batch_extend_ttl(MAX)");
 
     assert_has_headroom("batch_extend_ttl(MAX)", cost, 2);
+}
+
+/// **Instruction-count regression guard for the `batch_extend_ttl` hot path.**
+///
+/// At exactly [`MAX_BATCH_SIZE`] the sweep must stay under the documented CPU
+/// and memory ceilings. These are strict upper bounds, not merely "fits under
+/// the protocol limit": they exist so that a future change which adds a
+/// redundant storage read or host call to the per-stream loop fails here
+/// instead of silently eating the transaction budget in production.
+#[test]
+fn batch_extend_ttl_at_max_stays_under_documented_cpu_and_memory_ceilings() {
+    let h = Harness::new();
+    let ids: std::vec::Vec<u64> = (0..MAX_BATCH_SIZE)
+        .map(|_| h.create_simple(100 * ONE, YEAR))
+        .collect();
+
+    h.client.batch_extend_ttl(&h.ids(&ids));
+    let cost = report(&h, "batch_extend_ttl(MAX)");
+
+    assert!(
+        cost.instructions <= BATCH_EXTEND_TTL_INSTRUCTION_CEILING,
+        "batch_extend_ttl at cap used {} instructions, over the documented ceiling of {} \
+         (protocol limit is {INSTRUCTION_LIMIT})",
+        cost.instructions,
+        BATCH_EXTEND_TTL_INSTRUCTION_CEILING,
+    );
+    assert!(
+        cost.memory <= BATCH_EXTEND_TTL_MEMORY_CEILING,
+        "batch_extend_ttl at cap read {} in-memory entries, over the documented ceiling of {}",
+        cost.memory,
+        BATCH_EXTEND_TTL_MEMORY_CEILING,
+    );
+    assert_no_disk_reads("batch_extend_ttl(MAX)", cost);
+}
+
+/// The per-item cost of the TTL sweep must be flat: doubling the batch size
+/// must not more than double the instruction count. A hidden collection scan
+/// would show up here as super-linear growth long before it hit a protocol
+/// limit, which is exactly the regression this guards against.
+#[test]
+fn batch_extend_ttl_per_item_cost_stays_flat() {
+    let h = Harness::new();
+    let ids: std::vec::Vec<u64> = (0..MAX_BATCH_SIZE)
+        .map(|_| h.create_simple(100 * ONE, YEAR))
+        .collect();
+
+    let mut measurements = std::vec::Vec::new();
+    for size in [1usize, 4, 8, MAX_BATCH_SIZE as usize] {
+        h.client.batch_extend_ttl(&h.ids(&ids[..size]));
+        let cost = report(&h, &std::format!("batch_extend_ttl({size})"));
+        assert_no_disk_reads("batch_extend_ttl", cost);
+        measurements.push((size as u32, cost));
+    }
+
+    let (base_size, base) = measurements[0];
+    for &(size, cost) in &measurements[1..] {
+        // Linear bound: n items may cost at most n × the single-item cost,
+        // plus a constant to absorb fixed per-invocation overhead.
+        let linear_bound =
+            base.instructions * (size as i64 / base_size as i64) + PER_ITEM_FLATNESS_SLACK;
+        assert!(
+            cost.instructions <= linear_bound,
+            "batch_extend_ttl instructions grew super-linearly: {size} items took {} vs {} \
+             for one (linear bound {linear_bound})",
+            cost.instructions,
+            base.instructions,
+        );
+        assert!(
+            cost.memory <= base.memory * size + 8,
+            "batch_extend_ttl in-memory reads grew super-linearly: {size} items took {} vs {} \
+             for one",
+            cost.memory,
+            base.memory,
+        );
+    }
 }
 
 /// At [`MAX_BATCH_SIZE`] + 1 the TTL sweep must also be rejected with

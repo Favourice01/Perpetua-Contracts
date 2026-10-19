@@ -121,3 +121,5 @@ if [ "$size" -gt "$MAX_BYTES" ]; then
   exit 1
 fi
 
+echo "wasm size budget check passed (issue #290 keeper-runner optimizations)" >&2
+
