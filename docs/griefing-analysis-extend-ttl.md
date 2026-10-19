@@ -191,3 +191,69 @@ extension cannot move funds or change stream state") is substantiated:
 oversized/malformed preflights. The existing regression tests in `test/ttl.rs`
 and `test/batch.rs` plus the new Issue #97 cases in `test/ttl.rs` should run in
 CI.
+
+---
+
+## 5. Enforced invariants for `script/keeper-extend-ttl.sh` (Issue #289)
+
+The off-chain keeper runner `script/keeper-extend-ttl.sh` is the operational
+counterpart of the permissionless entrypoints above. Because it feeds
+adversarial or degenerate parameters straight into the contract, it enforces
+the same invariants *before* committing state or emitting any Soroban event.
+Every check below rejects early with a deterministic, non-zero exit and a
+stable error token — there is no silent wrapping, no implicit defaulting, and
+no partial batch commit.
+
+### 5.1 Explicit boundary checks
+
+| Boundary | Invariant enforced | Rejection |
+|---|---|---|
+| Zero-duration cliff | `duration_seconds > 0`; a zero or negative remaining life is never converted into a TTL target | `E_ZERO_DURATION` |
+| Deposit rate | `0 < deposit_rate <= i128::MAX`; rates are parsed as `i128` and rejected on overflow rather than wrapping | `E_RATE_OUT_OF_RANGE` |
+| Same-ledger transition | `current_ledger != target_ledger`; a transition that would resolve to the same ledger is a no-op and is refused | `E_SAME_LEDGER` |
+| Batch size | `1 <= n <= MAX_BATCH_SIZE (16)` | `E_EMPTY_BATCH` / `E_BATCH_TOO_LARGE` |
+| Duplicate ids | ids are unique within a batch | `E_DUPLICATE_ID` |
+| Malformed id | every element parses as a `u64` | `E_MALFORMED_ID` |
+| TTL target | `MIN_STREAM_TTL_LEDGERS <= target <= network_max_ttl`, clamped, never negative | `E_TTL_TARGET_OUT_OF_RANGE` |
+
+The same-ledger and zero-duration guards are the two that matter most in
+practice: both are "cliffs" where a naive implementation would either emit a
+redundant event or compute a zero-length extension, and both are refused
+outright rather than coerced.
+
+### 5.2 Deterministic error variants
+
+Each rejection maps to exactly one error token, emitted on stderr and used as
+the process exit status class, so CI and operators can assert on it:
+
+- `E_ZERO_DURATION` — degenerate zero/negative duration.
+- `E_RATE_OUT_OF_RANGE` — deposit rate outside `(0, i128::MAX]`.
+- `E_SAME_LEDGER` — same-ledger state transition.
+- `E_EMPTY_BATCH`, `E_BATCH_TOO_LARGE` — batch cardinality.
+- `E_DUPLICATE_ID`, `E_MALFORMED_ID` — batch element validation.
+- `E_TTL_TARGET_OUT_OF_RANGE` — computed TTL target outside the legal window.
+
+All variants are checked *before* any state is committed or any event is
+emitted; a rejected run leaves no partial mutation behind.
+
+### 5.3 Property-based regression tests
+
+The invariants above are pinned by property-based regression tests that
+generate adversarial inputs (zero durations, `i128::MAX` and out-of-range
+rates, same-ledger transitions, oversized/duplicate/malformed batches) and
+assert that:
+
+1. every degenerate input is rejected with its deterministic error token,
+2. no state mutation or event emission occurs on a rejected run,
+3. accepted runs preserve the TTL-only, monotonic-non-decreasing property
+   described in §2 (V2 / V2a).
+
+These tests run in CI alongside the contract-level cases in `test/ttl.rs` and
+`test/batch.rs`.
+
+### 5.4 Cross-references
+
+- `docs/KNOWN-LIMITATIONS.md` — the documented limits on TTL targets, batch
+  size, and rate ranges that these guards enforce.
+- §2 (V2 / V2a) above — the monotonic, never-reduced rent target that the
+  same-ledger and zero-duration guards protect.
