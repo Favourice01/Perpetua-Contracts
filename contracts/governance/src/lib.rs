@@ -495,7 +495,7 @@ const TERMINAL_PROPOSAL_RETENTION: u32 = ledgers(2_592_000);
 /// | Action          | Topic                                        | Data                                |
 /// |-----------------|----------------------------------------------|-------------------------------------|
 /// | propose         | `("proposal_created",  id, proposer)`        | `ProposalCreated`   (with target)   |
-/// | approve         | `("vote_cast",       id, voter)`             | `VoteCast`          (count + ts)    |
+/// | approve         | `("vote_cast",       id, voter)`             | `VoteCast`          (count + weight + ts) |
 /// | quorum reached  | `("proposal_queued", id)`                    | `ProposalQueued`    (timestamps)    |
 /// | execute         | `("proposal_executed", id, executor)`        | `ProposalExecuted`  (with target)   |
 /// | cancel          | `("proposal_cancelled", id, canceller)`      | `ProposalCancelled` (timestamp)     |
@@ -534,6 +534,8 @@ pub struct VoteCast {
     pub approval_count: u32,
     /// Ledger timestamp at which the vote was cast.
     pub timestamp: u64,
+    /// Accumulated voting weight after this approval.
+    pub approval_weight: u64,
 }
 
 /// Event: a proposal first reached quorum and was queued, starting the timelock
@@ -1378,7 +1380,7 @@ impl FluxoraGovernance {
 
         let threshold = get_threshold(&env)?;
         let now = env.ledger().timestamp();
-        let quorum_reached = if approval_count == threshold {
+        let quorum_reached = if accumulated >= threshold as u64 {
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
             proposal.eta = executable_after;
             proposal.status = ProposalStatus::Queued;
@@ -1399,6 +1401,7 @@ impl FluxoraGovernance {
                 voter: approver,
                 approval_count,
                 timestamp: now,
+                approval_weight: proposal.approval_weight,
             },
         );
 
@@ -3386,6 +3389,43 @@ mod tests {
         ctx.client.execute(&executor, &id);
         let p = ctx.client.get_proposal(&id);
         assert!(p.executed);
+    }
+
+    #[test]
+    fn test_weighted_approval_reaches_quorum_by_weight() {
+        let ctx = Ctx::setup();
+        ctx.client.set_vote_weight(&ctx.signer_a, &2u64);
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("weighted"));
+
+        ctx.client.approve(&ctx.signer_a, &id);
+
+        let proposal = ctx.client.get_proposal(&id);
+        assert_eq!(proposal.approval_weight, 2);
+        assert_eq!(proposal.status, ProposalStatus::Queued);
+        let quorum = ctx.client.get_quorum_info(&id).unwrap();
+        assert_eq!(quorum.threshold, 2);
+        assert_eq!(quorum.reached_at, 1_000_000);
+    }
+
+    #[test]
+    fn test_vote_event_includes_accumulated_weight() {
+        let ctx = Ctx::setup();
+        ctx.client.set_threshold(&3u32);
+        ctx.client.set_vote_weight(&ctx.signer_a, &2u64);
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("weighted-event"));
+
+        ctx.client.approve(&ctx.signer_a, &id);
+
+        let (topic, data) = last_contract_event(&ctx.env, &ctx.contract_id);
+        assert_eq!(topic, symbol_short!("vote_cast"));
+        let payload = VoteCast::try_from_val(&ctx.env, &data).expect("decodes to VoteCast");
+        assert_eq!(payload.proposal_id, id);
+        assert_eq!(payload.approval_count, 1);
+        assert_eq!(payload.approval_weight, 2);
     }
 
     /// In-flight proposals snapshot the threshold at quorum time: a proposal
