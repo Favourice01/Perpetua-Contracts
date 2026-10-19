@@ -4,12 +4,16 @@ use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Ledger as _},
     token::StellarAssetClient,
-    vec, Address, Env, IntoVal, Symbol,
+    vec, Address, BytesN, Env, IntoVal, Symbol,
 };
 
 const START_TIME: u64 = 1_700_000_000;
 const DURATION: u64 = 1_000;
 const DEPOSIT: i128 = 1_000_000;
+
+fn stream_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[7; 32])
+}
 
 #[contract]
 struct Forwarder;
@@ -84,7 +88,13 @@ impl Scenario {
 
         let admin = Address::generate(&env);
         let factory = FluxoraFactoryClient::new(&env, &factory_id);
-        factory.init(&admin, &stream_id, &(DEPOSIT * 2), &DURATION);
+        factory.init(
+            &admin,
+            &stream_id,
+            &stream_hash(&env),
+            &(DEPOSIT * 2),
+            &DURATION,
+        );
         Self {
             env,
             factory_id,

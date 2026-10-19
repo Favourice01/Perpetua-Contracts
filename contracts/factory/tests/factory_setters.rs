@@ -22,6 +22,52 @@ fn stream_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[7; 32])
 }
 
+#[contract]
+struct StreamStub;
+
+#[contractimpl]
+impl StreamStub {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream(
+        _env: Env,
+        _sender: Address,
+        _recipient: Address,
+        _token: Address,
+        _deposit: i128,
+        _start_time: u64,
+        _end_time: u64,
+        _cliff_time: u64,
+        _cancellable: bool,
+        _pausable: bool,
+        _transferable: bool,
+    ) -> u64 {
+        0
+    }
+}
+
+#[contract]
+struct FailingStreamStub;
+
+#[contractimpl]
+impl FailingStreamStub {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream(
+        _env: Env,
+        _sender: Address,
+        _recipient: Address,
+        _token: Address,
+        _deposit: i128,
+        _start_time: u64,
+        _end_time: u64,
+        _cliff_time: u64,
+        _cancellable: bool,
+        _pausable: bool,
+        _transferable: bool,
+    ) -> u64 {
+        panic!("temporary downstream failure")
+    }
+}
+
 #[test]
 fn test_stream_salt_is_unique_across_ten_thousand_creations() {
     let env = Env::default();
@@ -136,6 +182,32 @@ fn test_init_double_returns_already_initialized() {
     assert_eq!(result, Err(Ok(FactoryError::AlreadyInitialized)));
 }
 
+#[test]
+fn test_init_and_rate_setters_reject_invalid_numeric_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let fid = env.register_contract(None, FluxoraFactory);
+    let factory = FluxoraFactoryClient::new(&env, &fid);
+    let admin = Address::generate(&env);
+    let stream_contract = Address::generate(&env);
+
+    assert_eq!(
+        factory.try_init(&admin, &stream_contract, &stream_hash(&env), &0, &1),
+        Err(Ok(FactoryError::InvalidDeposit))
+    );
+    factory.init(&admin, &stream_contract, &stream_hash(&env), &10_000, &1);
+
+    assert_eq!(
+        factory.try_set_rate_bounds(&Some(-1), &None),
+        Err(Ok(FactoryError::InvalidRateBounds))
+    );
+    assert_eq!(
+        factory.try_set_rate_bounds(&Some(10), &Some(9)),
+        Err(Ok(FactoryError::InvalidRateBounds))
+    );
+    factory.set_rate_bounds(&Some(0), &Some(i128::MAX));
+}
+
 // ---------------------------------------------------------------------------
 // Views before init — NotInitialized
 // ---------------------------------------------------------------------------
@@ -189,6 +261,10 @@ fn test_setters_before_init_return_not_initialized() {
     );
     assert_eq!(
         factory.try_set_allowlist(&addr, &true),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+    assert_eq!(
+        factory.try_set_allowlist_enabled(&true),
         Err(Ok(FactoryError::NotInitialized))
     );
     assert_eq!(
@@ -300,7 +376,7 @@ fn test_duration_bounds_validate_and_update() {
     let factory = FluxoraFactoryClient::new(&env, &fid);
     let admin = Address::generate(&env);
     let sc = Address::generate(&env);
-    factory.init(&admin, &sc, &10_000, &3_600);
+    factory.init(&admin, &sc, &stream_hash(&env), &10_000, &3_600);
 
     factory.set_max_duration(&10_000);
     factory.validate_duration(&0, &3_600);
@@ -406,7 +482,7 @@ fn test_token_allowlist_add_remove_and_validate() {
     let admin = Address::generate(&env);
     let sc = Address::generate(&env);
     let token = Address::generate(&env);
-    factory.init(&admin, &sc, &10_000, &100);
+    factory.init(&admin, &sc, &stream_hash(&env), &10_000, &100);
 
     assert!(!factory.is_token_allowed(&token));
     assert_eq!(
@@ -434,7 +510,7 @@ fn test_set_pause_updates_policy() {
     let factory = FluxoraFactoryClient::new(&env, &fid);
     let admin = Address::generate(&env);
     let sc = Address::generate(&env);
-    factory.init(&admin, &sc, &10_000, &100);
+    factory.init(&admin, &sc, &stream_hash(&env), &10_000, &100);
 
     assert!(!factory.is_factory_paused());
     factory.set_pause(&true);
@@ -457,7 +533,7 @@ fn test_record_creation_enforces_sender_window_and_resets() {
     let admin = Address::generate(&env);
     let sc = Address::generate(&env);
     let sender = Address::generate(&env);
-    factory.init(&admin, &sc, &10_000, &100);
+    factory.init(&admin, &sc, &stream_hash(&env), &10_000, &100);
     factory.set_rate_limit(&2, &10);
     assert_eq!(
         factory.try_set_rate_limit(&0, &10),
@@ -603,7 +679,7 @@ fn test_set_pause_rejects_non_admin() {
     let sc = Address::generate(&env);
 
     env.mock_all_auths();
-    factory.init(&admin, &sc, &10_000, &100);
+    factory.init(&admin, &sc, &stream_hash(&env), &10_000, &100);
 
     env.mock_auths(&[MockAuth {
         address: &non_admin,
@@ -883,6 +959,7 @@ fn test_load_policy_reflects_initial_state() {
     assert_eq!(policy.min_duration, 100);
     assert!(policy.batch_cap_enforced, "init defaults batch-cap to true");
     assert!(!policy.creation_paused, "init defaults pause to false");
+    assert!(!policy.recipient_allowlist_enabled);
     assert_eq!(
         policy.min_rate_per_second, None,
         "no rate bounds by default"
@@ -917,6 +994,7 @@ fn test_load_policy_reflects_all_setters() {
     factory.set_min_duration(&250);
     factory.set_batch_cap_enforcement(&false);
     factory.set_factory_paused(&true);
+    factory.set_allowlist_enabled(&true);
     factory.set_rate_bounds(&Some(50), &Some(1_000));
 
     let policy: FactoryPolicy = env
@@ -928,6 +1006,7 @@ fn test_load_policy_reflects_all_setters() {
     assert_eq!(policy.min_duration, 250);
     assert!(!policy.batch_cap_enforced);
     assert!(policy.creation_paused);
+    assert!(policy.recipient_allowlist_enabled);
     assert_eq!(policy.min_rate_per_second, Some(50));
     assert_eq!(policy.max_rate_per_second, Some(1_000));
 }
@@ -1057,9 +1136,124 @@ fn test_load_policy_equality_is_struct_equality() {
     assert_ne!(p1, different);
 }
 
+#[test]
+fn test_creation_enforces_allowlist_and_math_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let stream_id = env.register_contract(None, StreamStub);
+    let fid = env.register_contract(None, FluxoraFactory);
+    let factory = FluxoraFactoryClient::new(&env, &fid);
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    factory.init(&admin, &stream_id, &stream_hash(&env), &i128::MAX, &1);
+    factory.set_allowlist(&recipient, &true);
+    assert!(factory.get_factory_config().recipient_allowlist_enabled);
+
+    let denied = factory.try_create_stream(
+        &sender, &stranger, &token, &100, &0, &100, &0, &true, &true, &true,
+    );
+    assert_eq!(denied, Err(Ok(FactoryError::AllowlistDenied)));
+
+    factory.set_allowlist_enabled(&false);
+    factory.set_rate_bounds(&None, &Some(10));
+    let excessive_rate = factory.try_create_stream(
+        &sender,
+        &recipient,
+        &token,
+        &i128::MAX,
+        &0,
+        &1,
+        &0,
+        &true,
+        &true,
+        &true,
+    );
+    assert_eq!(excessive_rate, Err(Ok(FactoryError::RateAboveMaximum)));
+
+    factory.set_rate_bounds(&Some(2), &Some(10));
+    let insufficient_rate = factory.try_create_stream(
+        &sender, &recipient, &token, &100, &0, &100, &0, &true, &true, &true,
+    );
+    assert_eq!(insufficient_rate, Err(Ok(FactoryError::RateBelowMinimum)));
+
+    let invalid_cliff = factory.try_create_stream(
+        &sender, &recipient, &token, &100, &0, &100, &101, &true, &true, &true,
+    );
+    assert_eq!(invalid_cliff, Err(Ok(FactoryError::InvalidCliff)));
+}
+
+#[test]
+fn test_creation_rejects_deposit_above_configured_cap_before_dispatch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let stream_id = env.register_contract(None, StreamStub);
+    let fid = env.register_contract(None, FluxoraFactory);
+    let factory = FluxoraFactoryClient::new(&env, &fid);
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    factory.init(&admin, &stream_id, &stream_hash(&env), &100, &1);
+    let result = factory.try_create_stream(
+        &sender, &recipient, &token, &101, &0, &100, &0, &true, &true, &true,
+    );
+    assert_eq!(result, Err(Ok(FactoryError::DepositCapExceeded)));
+}
+
+#[test]
+fn test_failed_downstream_creation_does_not_consume_rate_limit_or_capacity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let failing_stream = env.register_contract(None, FailingStreamStub);
+    let working_stream = env.register_contract(None, StreamStub);
+    let fid = env.register_contract(None, FluxoraFactory);
+    let factory = FluxoraFactoryClient::new(&env, &fid);
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    factory.init(&admin, &failing_stream, &stream_hash(&env), &10_000, &1);
+    factory.set_rate_limit(&1, &10);
+    factory.set_max_active_streams(&1);
+
+    let failed = factory.try_create_stream(
+        &sender, &recipient, &token, &1_000, &0, &100, &0, &true, &true, &true,
+    );
+    assert!(failed.is_err());
+    assert_eq!(factory.get_factory_config().active_streams, 0);
+
+    factory.set_stream_contract(&working_stream);
+    factory.create_stream(
+        &sender, &recipient, &token, &1_000, &0, &100, &0, &true, &true, &true,
+    );
+    assert_eq!(factory.get_factory_config().active_streams, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Active-stream capacity
 // ---------------------------------------------------------------------------
+
+#[test]
+fn stream_termination_rejects_counter_underflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let stream_id = env.register_contract(None, StreamStub);
+    let fid = env.register_contract(None, FluxoraFactory);
+    let factory = FluxoraFactoryClient::new(&env, &fid);
+    let admin = Address::generate(&env);
+
+    factory.init(&admin, &stream_id, &stream_hash(&env), &10_000, &1);
+    assert_eq!(
+        factory.try_stream_terminated(&123),
+        Err(Ok(FactoryError::ActiveStreamCountUnderflow))
+    );
+}
 
 #[test]
 fn active_stream_cap_blocks_creation_until_terminal_release() {
@@ -1073,7 +1267,7 @@ fn active_stream_cap_blocks_creation_until_terminal_release() {
     let recipient = Address::generate(&env);
     let token = Address::generate(&env);
 
-    factory.init(&admin, &stream_id, &10_000, &100);
+    factory.init(&admin, &stream_id, &stream_hash(&env), &10_000, &100);
     factory.set_max_active_streams(&1);
 
     factory.create_stream(
@@ -1134,7 +1328,7 @@ fn max_active_streams_is_admin_configurable() {
     let admin = Address::generate(&env);
     let stream_contract = Address::generate(&env);
 
-    factory.init(&admin, &stream_contract, &10_000, &100);
+    factory.init(&admin, &stream_contract, &stream_hash(&env), &10_000, &100);
     factory.set_max_active_streams(&25);
 
     let config = factory.get_factory_config();

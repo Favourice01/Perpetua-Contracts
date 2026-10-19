@@ -61,6 +61,10 @@ pub enum DataKey {
     /// The proposed next admin for the two-step rotation hand-off. Written by
     /// `propose_admin`, consumed (and cleared) by `accept_admin`.
     PendingAdmin,
+    /// Presence of an address under this key means the token is approved.
+    TokenAllowlist(Address),
+    /// Per-sender rolling creation bucket.
+    RateLimit(Address),
 }
 
 /// The full on-chain configuration record.
@@ -83,6 +87,8 @@ pub struct FactoryConfig {
     pub batch_cap_enforced: bool,
     /// When true, `create_stream` is rejected while the factory is paused.
     pub creation_paused: bool,
+    /// Whether recipient creation is restricted to persistent allowlist entries.
+    pub recipient_allowlist_enabled: bool,
     /// Optional lower bound on the per-second stream rate, applied at creation.
     pub min_rate_per_second: Option<i128>,
     /// Optional upper bound on the per-second stream rate, applied at creation.
@@ -91,6 +97,10 @@ pub struct FactoryConfig {
     pub max_active_streams: u32,
     /// Number of streams admitted but not yet released by a terminal callback.
     pub active_streams: u32,
+    /// Maximum creations allowed per sender in a rate-limit window.
+    pub max_creations_per_window: u32,
+    /// Rate-limit window length in ledgers.
+    pub rate_limit_window_ledgers: u32,
 }
 
 /// The policy view consumed by the stream-creation paths.
@@ -109,10 +119,20 @@ pub struct FactoryPolicy {
     pub max_duration: u64,
     pub batch_cap_enforced: bool,
     pub creation_paused: bool,
+    pub recipient_allowlist_enabled: bool,
     pub min_rate_per_second: Option<i128>,
     pub max_rate_per_second: Option<i128>,
     pub max_active_streams: u32,
     pub active_streams: u32,
+    pub max_creations_per_window: u32,
+    pub rate_limit_window_ledgers: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitBucket {
+    pub window_start: u32,
+    pub creations: u32,
 }
 
 /// A stream creation proxied by this factory.
@@ -148,6 +168,35 @@ pub enum FactoryError {
     InvalidNewAdmin = 5,
     /// `accept_admin` was called but no admin transfer has been proposed.
     NoPendingAdmin = 6,
+    InvalidDuration = 7,
+    TokenNotAllowed = 8,
+    RateLimitExceeded = 9,
+    InvalidRateLimit = 10,
+    CapacityCapExceeded = 11,
+    ActiveStreamCountUnderflow = 12,
+    CreationPaused = 13,
+    DepositCapExceeded = 14,
+    InvalidRateBounds = 15,
+    RateBelowMinimum = 16,
+    RateAboveMaximum = 17,
+    InvalidDeposit = 18,
+    InvalidCliff = 19,
+}
+
+pub trait FactoryGovernance {
+    fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError>;
+    fn set_stream_contract(env: Env, stream_contract: Address) -> Result<(), FactoryError>;
+    fn set_cap(env: Env, max_deposit: i128) -> Result<(), FactoryError>;
+    fn set_min_duration(env: Env, min_duration: u64) -> Result<(), FactoryError>;
+    fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError>;
+    fn set_allowlist_enabled(env: Env, enabled: bool) -> Result<(), FactoryError>;
+    fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError>;
+    fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError>;
+    fn set_rate_bounds(
+        env: Env,
+        min_rate_per_second: Option<i128>,
+        max_rate_per_second: Option<i128>,
+    ) -> Result<(), FactoryError>;
 }
 
 /// Emitted when an admin rotation is proposed (two-step hand-off, issue #39).
@@ -196,6 +245,10 @@ fn bump_ttl(env: &Env) {
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
+fn bump_instance(env: &Env) {
+    bump_ttl(env);
+}
+
 /// Returns the stored config or `NotInitialized`.
 fn load_config(env: &Env) -> Result<FactoryConfig, FactoryError> {
     let config = env
@@ -222,11 +275,49 @@ pub fn load_policy(env: &Env) -> Result<FactoryPolicy, FactoryError> {
         max_duration: config.max_duration,
         batch_cap_enforced: config.batch_cap_enforced,
         creation_paused: config.creation_paused,
+        recipient_allowlist_enabled: config.recipient_allowlist_enabled,
         min_rate_per_second: config.min_rate_per_second,
         max_rate_per_second: config.max_rate_per_second,
         max_active_streams: config.max_active_streams,
         active_streams: config.active_streams,
+        max_creations_per_window: config.max_creations_per_window,
+        rate_limit_window_ledgers: config.rate_limit_window_ledgers,
     })
+}
+
+fn record_creation_with_config(
+    env: &Env,
+    sender: &Address,
+    config: &FactoryConfig,
+) -> Result<(), FactoryError> {
+    sender.require_auth();
+
+    let key = DataKey::RateLimit(sender.clone());
+    let current_ledger = env.ledger().sequence();
+    let mut bucket = env
+        .storage()
+        .persistent()
+        .get::<_, RateLimitBucket>(&key)
+        .unwrap_or(RateLimitBucket {
+            window_start: current_ledger,
+            creations: 0,
+        });
+
+    if current_ledger.saturating_sub(bucket.window_start) >= config.rate_limit_window_ledgers {
+        bucket.window_start = current_ledger;
+        bucket.creations = 0;
+    }
+    if bucket.creations >= config.max_creations_per_window {
+        return Err(FactoryError::RateLimitExceeded);
+    }
+
+    bucket.creations = bucket
+        .creations
+        .checked_add(1)
+        .ok_or(FactoryError::RateLimitExceeded)?;
+    env.storage().persistent().set(&key, &bucket);
+    bump_allowlist(env, &key);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +380,9 @@ impl FluxoraFactory {
         if min_duration > DEFAULT_MAX_DURATION {
             return Err(FactoryError::InvalidDuration);
         }
+        if max_deposit <= 0 {
+            return Err(FactoryError::InvalidDeposit);
+        }
 
         let config = FactoryConfig {
             admin,
@@ -300,10 +394,13 @@ impl FluxoraFactory {
             // Documented init defaults for the optional axes.
             batch_cap_enforced: true,
             creation_paused: false,
+            recipient_allowlist_enabled: false,
             min_rate_per_second: None,
             max_rate_per_second: None,
             max_active_streams: u32::MAX,
             active_streams: 0,
+            max_creations_per_window: u32::MAX,
+            rate_limit_window_ledgers: DEFAULT_RATE_LIMIT_WINDOW_LEDGERS,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         bump_ttl(&env);
@@ -351,9 +448,12 @@ impl FluxoraFactory {
         load_config(&env).map_or_else(
             |e| panic_with_error!(&env, e),
             |_| {
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::TokenAllowlist(token))
+                let key = DataKey::TokenAllowlist(token);
+                let allowed = env.storage().persistent().has(&key);
+                if allowed {
+                    bump_allowlist(&env, &key);
+                }
+                allowed
             },
         )
     }
@@ -361,11 +461,9 @@ impl FluxoraFactory {
     /// Validate a token before forwarding a stream-creation request.
     pub fn validate_token(env: Env, token: Address) -> Result<(), FactoryError> {
         load_config(&env)?;
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::TokenAllowlist(token))
-        {
+        let key = DataKey::TokenAllowlist(token);
+        if env.storage().persistent().has(&key) {
+            bump_allowlist(&env, &key);
             Ok(())
         } else {
             Err(FactoryError::TokenNotAllowed)
@@ -382,7 +480,7 @@ impl FluxoraFactory {
         let duration = end_time
             .checked_sub(start_time)
             .ok_or(FactoryError::InvalidDuration)?;
-        if duration < config.min_duration || duration > config.max_duration {
+        if duration == 0 || duration < config.min_duration || duration > config.max_duration {
             return Err(FactoryError::InvalidDuration);
         }
         Ok(())
@@ -396,33 +494,7 @@ impl FluxoraFactory {
     /// from consuming a slot.
     pub fn record_creation(env: Env, sender: Address) -> Result<(), FactoryError> {
         let config = load_config(&env)?;
-        sender.require_auth();
-
-        let key = DataKey::RateLimit(sender);
-        let current_ledger = env.ledger().sequence();
-        let mut bucket = env
-            .storage()
-            .persistent()
-            .get::<_, RateLimitBucket>(&key)
-            .unwrap_or(RateLimitBucket {
-                window_start: current_ledger,
-                creations: 0,
-            });
-
-        if current_ledger.saturating_sub(bucket.window_start)
-            >= config.rate_limit_window_ledgers
-        {
-            bucket.window_start = current_ledger;
-            bucket.creations = 0;
-        }
-        if bucket.creations >= config.max_creations_per_window {
-            return Err(FactoryError::RateLimitExceeded);
-        }
-
-        bucket.creations += 1;
-        env.storage().persistent().set(&key, &bucket);
-        bump_allowlist(&env, &key);
-        Ok(())
+        record_creation_with_config(&env, &sender, &config)
     }
 
     /// True when the factory is paused and stream creation is rejected.
@@ -582,6 +654,9 @@ impl FluxoraFactory {
     /// Update the per-stream capacity cap.
     pub fn set_cap(env: Env, max_deposit: i128) -> Result<(), FactoryError> {
         let mut config = Self::guard(&env)?;
+        if max_deposit <= 0 {
+            return Err(FactoryError::InvalidDeposit);
+        }
         config.max_deposit = max_deposit;
         env.storage().instance().set(&DataKey::Config, &config);
         bump_ttl(&env);
@@ -616,14 +691,26 @@ impl FluxoraFactory {
     ///
     /// Removing a recipient that was never added is a safe no-op.
     pub fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError> {
-        Self::guard(&env)?;
+        let mut config = Self::guard(&env)?;
         let key = DataKey::Allowlist(recipient);
         if allowed {
             env.storage().persistent().set(&key, &true);
             bump_allowlist(&env, &key);
+            config.recipient_allowlist_enabled = true;
+            env.storage().instance().set(&DataKey::Config, &config);
+            bump_ttl(&env);
         } else {
             env.storage().persistent().remove(&key);
         }
+        Ok(())
+    }
+
+    /// Enable or disable recipient allowlist enforcement without deleting entries.
+    pub fn set_allowlist_enabled(env: Env, enabled: bool) -> Result<(), FactoryError> {
+        let mut config = Self::guard(&env)?;
+        config.recipient_allowlist_enabled = enabled;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -674,6 +761,12 @@ impl FluxoraFactory {
         max_rate_per_second: Option<i128>,
     ) -> Result<(), FactoryError> {
         let mut config = Self::guard(&env)?;
+        if min_rate_per_second.is_some_and(|rate| rate < 0)
+            || max_rate_per_second.is_some_and(|rate| rate < 0)
+            || matches!((min_rate_per_second, max_rate_per_second), (Some(min), Some(max)) if min > max)
+        {
+            return Err(FactoryError::InvalidRateBounds);
+        }
         config.min_rate_per_second = min_rate_per_second;
         config.max_rate_per_second = max_rate_per_second;
         env.storage().instance().set(&DataKey::Config, &config);
@@ -711,8 +804,53 @@ impl FluxoraFactory {
         transferable: bool,
     ) -> Result<u64, FactoryError> {
         let mut config = load_config(&env)?;
+        if config.creation_paused {
+            return Err(FactoryError::CreationPaused);
+        }
+        if config.recipient_allowlist_enabled {
+            let allowlist_key = DataKey::Allowlist(recipient.clone());
+            if !env.storage().persistent().has(&allowlist_key) {
+                return Err(FactoryError::AllowlistDenied);
+            }
+            bump_allowlist(&env, &allowlist_key);
+        }
         if config.active_streams >= config.max_active_streams {
             return Err(FactoryError::CapacityCapExceeded);
+        }
+        if deposit > config.max_deposit {
+            return Err(FactoryError::DepositCapExceeded);
+        }
+        if deposit <= 0 {
+            return Err(FactoryError::InvalidDeposit);
+        }
+        let duration = end_time
+            .checked_sub(start_time)
+            .ok_or(FactoryError::InvalidDuration)?;
+        if duration < config.min_duration || duration > config.max_duration || duration == 0 {
+            return Err(FactoryError::InvalidDuration);
+        }
+        if cliff_time < start_time || cliff_time > end_time {
+            return Err(FactoryError::InvalidCliff);
+        }
+        if config.min_rate_per_second.is_some() || config.max_rate_per_second.is_some() {
+            let rate = deposit
+                .checked_div(duration as i128)
+                .ok_or(FactoryError::InvalidDuration)?;
+            if config
+                .min_rate_per_second
+                .is_some_and(|minimum| rate < minimum)
+            {
+                return Err(FactoryError::RateBelowMinimum);
+            }
+            if config
+                .max_rate_per_second
+                .is_some_and(|maximum| rate > maximum)
+            {
+                return Err(FactoryError::RateAboveMaximum);
+            }
+        }
+        if config.max_creations_per_window != u32::MAX {
+            record_creation_with_config(&env, &sender, &config)?;
         }
 
         let stream_id = env.invoke_contract::<u64>(
@@ -733,7 +871,10 @@ impl FluxoraFactory {
                 .into_val(&env),
         );
 
-        config.active_streams += 1;
+        config.active_streams = config
+            .active_streams
+            .checked_add(1)
+            .ok_or(FactoryError::CapacityCapExceeded)?;
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(stream_id)
     }
@@ -742,7 +883,7 @@ impl FluxoraFactory {
     ///
     /// Only the configured stream contract may call this callback. The stream
     /// contract integration should invoke it exactly once for cancellation or
-    /// depletion; duplicate callbacks are rejected rather than underflowing.
+    /// depletion. Calls made when the active count is already zero are rejected.
     pub fn stream_terminated(env: Env, _stream_id: u64) -> Result<(), FactoryError> {
         let mut config = load_config(&env)?;
         config.stream_contract.require_auth();
@@ -796,6 +937,10 @@ impl FactoryGovernance for FluxoraFactory {
 
     fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError> {
         FluxoraFactory::set_allowlist(env, recipient, allowed)
+    }
+
+    fn set_allowlist_enabled(env: Env, enabled: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_allowlist_enabled(env, enabled)
     }
 
     fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError> {

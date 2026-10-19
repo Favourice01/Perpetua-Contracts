@@ -9,7 +9,7 @@
 
 use fluxora_factory::{FactoryError, FluxoraFactory, FluxoraFactoryClient};
 use soroban_sdk::testutils::{Address as _, Events, MockAuth, MockAuthInvoke};
-use soroban_sdk::{Address, Env, IntoVal, String, Symbol, TryFromVal, Val};
+use soroban_sdk::{Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val};
 use std::panic::AssertUnwindSafe;
 
 /// The all-zeros Stellar account — the "burn" sentinel the factory refuses.
@@ -17,6 +17,10 @@ const ZERO_ACCOUNT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 fn zero_address(env: &Env) -> Address {
     Address::from_string(&String::from_str(env, ZERO_ACCOUNT))
+}
+
+fn stream_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[7; 32])
 }
 
 /// Fresh initialised factory. `mock_all_auths` covers the `init` call.
@@ -33,7 +37,7 @@ fn setup() -> (
     let factory = FluxoraFactoryClient::new(&env, &fid);
     let admin = Address::generate(&env);
     let sc = Address::generate(&env);
-    factory.init(&admin, &sc, &10_000, &100);
+    factory.init(&admin, &sc, &stream_hash(&env), &10_000, &100);
     (env, fid, factory, admin, sc)
 }
 

@@ -37,7 +37,7 @@ This repository is a single repo with two independent halves:
    workspace), so it can be built, tested and released independently:
    - `contracts/stream` — the product: the streaming primitive.
    - `contracts/factory` — policy gate: capacity cap, minimum duration, rate
-     bounds, allowlist, creation pause.
+     bounds, allowlist, creation pause. See [the factory specification](docs/factory.md).
    - `contracts/governance` — timelocked multi-sig tuning of factory policy.
    - `contracts/archival-probe` — a deliberate throwaway that proves the
      live-network archival/restore round trip. Never deploy it.
