@@ -111,3 +111,76 @@ export function formatResult(result: PerpetuaCliResult): string {
   }
   return result.output;
 }
+
+// ---------------------------------------------------------------------------
+// Event/state schema parity (docs/ABI.md) and fault recovery
+// ---------------------------------------------------------------------------
+
+/** Frozen topic layouts for the events the CLI produces or inspects. */
+export const CLI_EVENT_TOPIC_LAYOUTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  withdrawn: ["symbol:withdrawn", "u64:stream_id"],
+});
+
+/** Frozen payload layouts matching tests/fixtures/event_snapshots/. */
+export const CLI_EVENT_PAYLOAD_SCHEMAS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  withdrawn: ["i128:amount", "i128:remaining_balance"],
+});
+
+export interface RecoveryGuidance {
+  kind: "archived" | "ledger_skew" | "retryable" | "fatal";
+  action: string;
+}
+
+/** Archived = not live but id was allocated (see restore_footprint.ts). */
+export function isArchivedStream(streamExists: boolean, streamCount: bigint, streamId: number): boolean {
+  return streamExists === false && BigInt(streamId) < streamCount;
+}
+
+/**
+ * Reads served from a node behind the ledger we already observed must be
+ * rejected so a lagging RPC never overwrites newer state.
+ */
+export function isLedgerSkewed(observedLedger: number, minLedger: number): boolean {
+  return observedLedger < minLedger;
+}
+
+/** Deterministically classify a failure into operator guidance. */
+export function classifyFailure(message: string): RecoveryGuidance {
+  const m = message.toLowerCase();
+  if (m.includes("archived") || m.includes("restore") || m.includes("entry expired")) {
+    return {
+      kind: "archived",
+      action: "Submit a RestoreFootprint transaction for the stream key, then retry the command.",
+    };
+  }
+  if (m.includes("skew") || m.includes("stale ledger")) {
+    return { kind: "ledger_skew", action: "Re-read at a ledger >= the last observed ledger, then retry." };
+  }
+  if (m.includes("try_again_later") || m.includes("timeout") || m.includes("timed out")) {
+    return { kind: "retryable", action: "Retry with the same inputs; the operation is idempotent." };
+  }
+  return { kind: "fatal", action: "Do not retry; escalate to the on-call engineer." };
+}
+
+/**
+ * Retry a failed/timed-out invocation. `isDone` is checked before every attempt
+ * so an invocation that actually landed is never submitted twice.
+ */
+export async function retryIdempotent<T>(
+  attempt: () => Promise<T>,
+  isDone: () => Promise<T | undefined>,
+  maxAttempts = 3,
+): Promise<T> {
+  let lastError: unknown;
+  for (let i = 0; i < maxAttempts; i++) {
+    const done = await isDone();
+    if (done !== undefined) return done;
+    try {
+      return await attempt();
+    } catch (err) {
+      lastError = err;
+      if (classifyFailure(err instanceof Error ? err.message : String(err)).kind === "fatal") throw err;
+    }
+  }
+  throw lastError;
+}

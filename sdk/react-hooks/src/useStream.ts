@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Stream } from './types.js';
 import { usePerpetua } from './usePerpetua.js';
+import { classifyStreamError, type StreamFailureKind } from './recovery.js';
 
 export interface UseStreamOptions {
   /**
@@ -18,6 +19,8 @@ export interface UseStreamResult {
   loading: boolean;
   /** Last error from a fetch, cleared on the next success. */
   error: Error | null;
+  /** Classification of `error`: `archived` needs RestoreFootprint; `retryable` is safe to refresh. */
+  errorKind: StreamFailureKind | null;
   /** Force a refetch of the current id. */
   refresh: () => Promise<void>;
 }
@@ -37,6 +40,7 @@ export function useStream(streamId: bigint, opts: UseStreamOptions = {}): UseStr
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<Error | null>(null);
   const disposed = useRef(false);
+  const [errorKind, setErrorKind] = useState<StreamFailureKind | null>(null);
   const loadingRef = useRef(true);
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -48,9 +52,12 @@ export function useStream(streamId: bigint, opts: UseStreamOptions = {}): UseStr
       if (disposed.current) return;
       setStream(next);
       setError(null);
+      setErrorKind(null);
     } catch (err) {
       if (disposed.current) return;
+      // Keep the last good stream on failure so skewed/archived reads never corrupt state.
       setError(err instanceof Error ? err : new Error(String(err)));
+      setErrorKind(classifyStreamError(err));
     } finally {
       loadingRef.current = false;
       if (!disposed.current) setLoading(false);
@@ -74,5 +81,5 @@ export function useStream(streamId: bigint, opts: UseStreamOptions = {}): UseStr
     return () => clearInterval(timer);
   }, [refresh, refreshIntervalMs]);
 
-  return { stream, loading, error, refresh };
+  return { stream, loading, error, errorKind, refresh };
 }

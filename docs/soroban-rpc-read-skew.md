@@ -885,3 +885,18 @@ keeper and page the on-call engineer rather than looping.
 a continuous payment streaming primitive for Soroban. The pattern is the point;
 the observation is one data point. Corrections and contradicting data are both
 welcome, and we will amend this note.*
+
+## Client recovery: `perpetua-cli` and `useStream`
+
+Both `tools/perpetua-cli.ts` and `sdk/react-hooks/src/useStream.ts` apply the
+same rules:
+
+- **Archived entries.** `stream_exists(id) == false && id < stream_count()`
+  means the entry is archived, not absent. Submit a `RestoreFootprint`
+  transaction for `DataKey::Stream(id)` and refresh. `useStream` exposes
+  `errorKind === 'archived'`; the CLI's `classifyFailure` returns restore guidance.
+- **Read skew.** A read from a ledger older than one already applied is
+  discarded (`isLedgerSkewed` / `isStaleRead`); the last good stream is kept.
+- **Idempotent retry.** `retryIdempotent` checks whether the invocation already
+  landed before every attempt, retries only `TRY_AGAIN_LATER`/timeouts, and
+  never retries contract errors (escalate instead).
